@@ -11,19 +11,28 @@ import { DUMMY_QUESTIONS } from "@/game/content/dummyQuestions";
 export { DUMMY_QUESTIONS } from "@/game/content/dummyQuestions";
 export * from "@/game/content/schema";
 
-/** TODO(task_content): 科目・学年で問題を絞り込む。 */
 export function getQuestionsBySubjectGrade(
-  _subject: Subject,
-  _grade: GradeLevel,
+  subject: Subject,
+  grade: GradeLevel,
 ): ContentItem[] {
-  return DUMMY_QUESTIONS;
+  return DUMMY_QUESTIONS.filter(
+    (item) => item.subject === subject && item.grade === grade,
+  );
 }
 
-/** TODO(task_content): 指定件数をランダムに抽出する(索敵・ロックオン両フェーズで使用)。 */
 export function getRandomQuestions(
-  _subject: Subject,
-  _grade: GradeLevel,
-  _count: number,
+  subject: Subject,
+  grade: GradeLevel,
+  count: number,
 ): ContentItem[] {
-  return DUMMY_QUESTIONS;
+  const filtered = getQuestionsBySubjectGrade(subject, grade);
+  const actual = Math.min(count, filtered.length);
+
+  const shuffled = [...filtered];
+  for (let i = shuffled.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+  }
+
+  return shuffled.slice(0, actual);
 }

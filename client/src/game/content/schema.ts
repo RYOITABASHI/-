@@ -18,17 +18,28 @@ export const gradeLevelSchema = z.enum(["grade2", "grade5"]);
 
 export const difficultySchema = z.union([z.literal(1), z.literal(2), z.literal(3)]);
 
-/** TODO(task_content): ContentItem型と一致するzodスキーマを完成させる。 */
-export const contentItemSchema = z.object({
-  id: z.string(),
-  subject: subjectSchema,
-  grade: gradeLevelSchema,
-  unit: z.string(),
-  prompt: z.string(),
-  choices: z.array(questionChoiceSchema).min(2),
-  correctChoiceId: z.string(),
-  explanation: z.string(),
-  hintText: z.string().optional(),
-  difficulty: difficultySchema,
-  tags: z.array(z.string()).optional(),
-});
+export const contentItemSchema = z
+  .object({
+    id: z.string(),
+    subject: subjectSchema,
+    grade: gradeLevelSchema,
+    unit: z.string(),
+    prompt: z.string(),
+    choices: z.array(questionChoiceSchema).min(2),
+    correctChoiceId: z.string(),
+    explanation: z.string(),
+    hintText: z.string().optional(),
+    difficulty: difficultySchema,
+    tags: z.array(z.string()).optional(),
+  })
+  .refine(
+    (item) => {
+      const choiceIds = new Set(item.choices.map((c) => c.id));
+      return choiceIds.size === item.choices.length;
+    },
+    { message: "choice id must be unique" },
+  )
+  .refine(
+    (item) => item.choices.some((c) => c.id === item.correctChoiceId),
+    { message: "correctChoiceId must exist in choices" },
+  );
