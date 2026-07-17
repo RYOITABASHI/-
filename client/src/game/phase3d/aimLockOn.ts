@@ -1,10 +1,7 @@
 // client/src/game/phase3d/aimLockOn.ts
 //
 // [担当: task_3d_core] 照準保持0.3秒でロックオンが成立するトラッキング方式のロジック。
-// LOCK_ON_HOLD_MS (types.ts) を必ず参照すること。Babylon型に依存しない純粋な状態機械
-// として実装し、テストしやすくすること。
-// 実装ガイドは実装計画JSONの task_3d_core.instructions を参照。
-// 現時点ではスタブ。
+// LOCK_ON_HOLD_MS (types.ts) を参照。Babylon型に依存しない純粋な状態機械。
 
 import { LOCK_ON_HOLD_MS } from "@/game/types";
 
@@ -19,18 +16,34 @@ export function createInitialAimLockState(): AimLockState {
 }
 
 /**
- * TODO(task_3d_core): 毎フレーム呼び出す。現在照準中のターゲットIDと現在時刻(ms)から
- * 次のAimLockStateを計算する。
- * - targetIdがnullまたは前回と異なる場合は保持をリセットする。
- * - holdStartedAtMsからLOCK_ON_HOLD_MS経過したらlocked=trueにする。
+ * 毎フレーム呼び出す。現在照準中のターゲットID(照準していなければnull)と
+ * 現在時刻(ms)から次のAimLockStateを計算する。
+ * - currentTargetId が前回と異なる(nullを含む)場合は保持をリセットする。
+ * - 同一ターゲットを LOCK_ON_HOLD_MS 継続照準したら locked=true にする。
  */
 export function updateAimLockState(
-  _state: AimLockState,
-  _currentTargetId: string | null,
-  _nowMs: number,
+  state: AimLockState,
+  currentTargetId: string | null,
+  nowMs: number,
 ): AimLockState {
-  return createInitialAimLockState();
+  // ターゲットが変わった(照準を外した/別対象に移った)場合はリセット。
+  if (currentTargetId !== state.targetId) {
+    return {
+      targetId: currentTargetId,
+      holdStartedAtMs: currentTargetId === null ? null : nowMs,
+      locked: false,
+    };
+  }
+
+  // 照準していない状態が継続。
+  if (currentTargetId === null) {
+    return { targetId: null, holdStartedAtMs: null, locked: false };
+  }
+
+  // 同一ターゲットを継続照準中。開始時刻が未設定なら補完する。
+  const startedAt = state.holdStartedAtMs ?? nowMs;
+  const locked = state.locked || nowMs - startedAt >= LOCK_ON_HOLD_MS;
+  return { targetId: currentTargetId, holdStartedAtMs: startedAt, locked };
 }
 
-// LOCK_ON_HOLD_MS を再エクスポートし、このモジュールだけを見れば必要な定数が揃うようにする。
 export { LOCK_ON_HOLD_MS };
