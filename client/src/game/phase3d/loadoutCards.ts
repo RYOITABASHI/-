@@ -11,7 +11,7 @@ export const DUMMY_LOADOUT_CARDS: LoadoutCard[] = [
     subject: "japanese",
     name: "国語偵察",
     description:
-      "文章の要点を素早く索敵するクラス。読解ヒントが多く、じっくり狙える。",
+      "文章の要点を遠距離から精密射撃するクラス。読解ヒントが多く、じっくり狙える。",
     perk: { extraHint: 2, lockOnGraceMs: 100 },
   },
   {
@@ -19,7 +19,7 @@ export const DUMMY_LOADOUT_CARDS: LoadoutCard[] = [
     subject: "math",
     name: "算数工兵",
     description:
-      "解法と手順を組み立てるクラス。ロックオン猶予は控えめ、公式ヒントに強い。",
+      "解法と手順を組み立てる汎用アサルトクラス。ロックオン猶予は控えめ、公式ヒントに強い。",
     perk: { extraHint: 1, lockOnGraceMs: 50 },
   },
   {
@@ -27,7 +27,7 @@ export const DUMMY_LOADOUT_CARDS: LoadoutCard[] = [
     subject: "english",
     name: "英語通信",
     description:
-      "単語と音を通信で拾うクラス。ロックオン猶予が長く、リズムよく狙える。",
+      "単語と音を近~中距離で速射する通信クラス。ロックオン猶予が長く、リズムよく狙える。",
     perk: { extraHint: 1, lockOnGraceMs: 80 },
   },
 ];
