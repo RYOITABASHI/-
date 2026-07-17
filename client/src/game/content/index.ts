@@ -6,16 +6,16 @@
 // 実装ガイドは実装計画JSONの task_content.instructions を参照。
 
 import type { ContentItem, GradeLevel, Subject } from "@/game/types";
-import { DUMMY_QUESTIONS } from "@/game/content/dummyQuestions";
+import { CURRICULUM_QUESTIONS } from "@/game/content/curriculumQuestions";
 
-export { DUMMY_QUESTIONS } from "@/game/content/dummyQuestions";
+export { CURRICULUM_QUESTIONS } from "@/game/content/curriculumQuestions";
 export * from "@/game/content/schema";
 
 export function getQuestionsBySubjectGrade(
   subject: Subject,
   grade: GradeLevel,
 ): ContentItem[] {
-  return DUMMY_QUESTIONS.filter(
+  return CURRICULUM_QUESTIONS.filter(
     (item) => item.subject === subject && item.grade === grade,
   );
 }

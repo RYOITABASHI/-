@@ -6,7 +6,7 @@
 // 一致するかを判定する。誤入力は最大MAX_ATTEMPTS回までリトライ可能とし、
 // 上限到達で失敗確定とする。
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -43,6 +43,26 @@ function correctOrderIds(sequence: BossSequence): string[] {
   return [...sequence.steps].sort((a, b) => a.order - b.order).map(s => s.id);
 }
 
+/**
+ * steps の id が重複していないか、order が 1 から欠番・重複なしの連番になっているかを
+ * 検証する。データ不整合があると inputOrder.includes(stepId) 等の判定が壊れ、
+ * ユーザーがクリアできなくなる恐れがあるため、事前に検知してフォールバック表示に
+ * 切り替えるためのチェック。
+ */
+function isValidSequence(sequence: BossSequence): boolean {
+  const { steps } = sequence;
+  if (steps.length === 0) return false;
+
+  const ids = steps.map(s => s.id);
+  if (new Set(ids).size !== ids.length) return false;
+
+  const orders = [...steps.map(s => s.order)].sort((a, b) => a - b);
+  for (let i = 0; i < orders.length; i++) {
+    if (orders[i] !== i + 1) return false;
+  }
+  return true;
+}
+
 export default function BossSequenceGame({
   sequence,
   onComplete,
@@ -56,8 +76,29 @@ export default function BossSequenceGame({
   const startedAtRef = useRef(Date.now());
   const completedRef = useRef(false);
 
+  // sequence.steps の id 重複 / order の欠番・重複を検知する。壊れたデータのまま
+  // ゲームを進行させるとタップ済み判定や完了判定が破綻するため、事前にガードする。
+  const sequenceValid = useMemo(() => isValidSequence(sequence), [sequence]);
+
+  // 正解順のid配列はタップのたびに再計算する必要がないので、sequence変更時のみ計算する。
+  const correctOrder = useMemo(
+    () => (sequenceValid ? correctOrderIds(sequence) : []),
+    [sequence, sequenceValid]
+  );
+
+  useEffect(() => {
+    if (!sequenceValid) {
+      console.error(
+        "BossSequenceGame: sequence.steps に不正なデータがあります(idの重複、またはorderの欠番/重複)。",
+        sequence
+      );
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sequenceValid, sequence.id]);
+
   // sequenceが変わったら(通常はミッションフェーズ遷移時)全状態をリセットする。
   useEffect(() => {
+    if (!sequenceValid) return;
     setDisplaySteps(shuffleSteps(sequence.steps));
     setInputOrder([]);
     setFailedAttempts(0);
@@ -65,7 +106,7 @@ export default function BossSequenceGame({
     startedAtRef.current = Date.now();
     completedRef.current = false;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sequence.id]);
+  }, [sequence.id, sequenceValid]);
 
   function finish(
     success: boolean,
@@ -93,9 +134,7 @@ export default function BossSequenceGame({
 
     if (nextInput.length < sequence.steps.length) return;
 
-    const success = nextInput.every(
-      (id, i) => id === correctOrderIds(sequence)[i]
-    );
+    const success = nextInput.every((id, i) => id === correctOrder[i]);
     // attempts = 完了した試行(成功含む)の総数。
     const attemptsSoFar = failedAttempts + 1;
 
@@ -120,6 +159,23 @@ export default function BossSequenceGame({
     id => sequence.steps.find(s => s.id === id)?.label ?? "?"
   );
   const remainingAttempts = MAX_ATTEMPTS - failedAttempts;
+
+  // データ不整合(id重複 / order欠番・重複)の場合はゲームを進行させず、
+  // クラッシュや判定破綻を避けるための安全なフォールバック表示にする。
+  if (!sequenceValid) {
+    return (
+      <div className="flex min-h-svh flex-col gap-4 p-4 sm:p-6">
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base">再現ボス戦</CardTitle>
+            <CardDescription>
+              このステップは現在利用できません。しばらくしてから再度お試しください。
+            </CardDescription>
+          </CardHeader>
+        </Card>
+      </div>
+    );
+  }
 
   return (
     <div className="flex min-h-svh flex-col gap-4 p-4 sm:p-6">

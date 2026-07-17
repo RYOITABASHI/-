@@ -7,7 +7,9 @@
 
 import type { GradeLevel, Profile, ProgressRecord } from "@/game/types";
 
-const STORAGE_PREFIX = "gakushu-fps";
+/** アプリ全体のlocalStorageキー共通プレフィックス。他ドメイン(例: 性能計測キャッシュ)も
+ *  キー名の一貫性のためこれを再利用すること。 */
+export const STORAGE_PREFIX = "gakushu-fps";
 
 export const STORAGE_KEYS = {
   profileList: `${STORAGE_PREFIX}:profiles`,

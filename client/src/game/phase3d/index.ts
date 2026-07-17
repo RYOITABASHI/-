@@ -9,3 +9,4 @@ export * from "@/game/phase3d/loadoutCards";
 export * from "@/game/phase3d/railPath";
 export * from "@/game/phase3d/droneAI";
 export * from "@/game/phase3d/aimLockOn";
+export * from "@/game/phase3d/perfBenchmark";

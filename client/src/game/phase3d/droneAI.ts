@@ -11,6 +11,11 @@ export interface DronePosition2D {
   x: number;
   /** 経路に対する垂直オフセット(zigzagのサイン波)。 */
   y: number;
+  /**
+   * spawnDelayMs 経過前は false。呼び出し側(描画)はこれを見て非表示にすること
+   * (x, y は spawnDelayMs 未経過中は原点のダミー値なので描画に使わない)。
+   */
+  visible: boolean;
 }
 
 const ACCEL_MAX_MULTIPLIER = 2.5;
@@ -48,22 +53,35 @@ export function getSpeedMultiplier(
  * 経過時間(ms)からドローンの位置を計算する。
  * 前進は x = baseSpeed * multiplier を時間積分した近似(等速/加速で扱いを変える)、
  * zigzag のみ垂直方向 y にサイン波オフセットを加える。
- * spawnDelayMs 経過前は原点に留める。
+ * spawnDelayMs 経過前は visible: false を返す(呼び出し側は非表示にすること)。
  */
 export function computeDronePosition(
   spec: DroneSpec,
   elapsedMs: number,
 ): DronePosition2D {
   const active = Math.max(0, elapsedMs - spec.spawnDelayMs);
-  if (active <= 0) return { x: 0, y: 0 };
+  if (active <= 0) return { x: 0, y: 0, visible: false };
 
   const seconds = active / 1000;
   let x: number;
   if (spec.pattern === "accelerating") {
-    // 係数が線形に増える区間の移動量 = 面積(台形)を積分した近似。
-    const mult = getSpeedMultiplier("accelerating", active);
-    const avgMult = (1 + mult) / 2;
-    x = spec.baseSpeed * seconds * avgMult;
+    // ランプ区間(0〜ACCEL_RAMP_MS、倍率が線形に上昇)と、それ以降(倍率が
+    // ACCEL_MAX_MULTIPLIERで一定)に分けて距離を積分し合算する。
+    // こうしないと、ランプ完了後も平均倍率をかけ続けてしまい、経過時間が
+    // 長くなるほど実際より遅く進む(オーバーシュートしない代わりに
+    // アンダーシュートする)バグになる。
+    const rampMs = Math.min(active, ACCEL_RAMP_MS);
+    const rampSeconds = rampMs / 1000;
+    const rampEndMult = getSpeedMultiplier("accelerating", rampMs);
+    const avgRampMult = (1 + rampEndMult) / 2;
+    const rampDistance = spec.baseSpeed * rampSeconds * avgRampMult;
+
+    const postRampMs = Math.max(0, active - ACCEL_RAMP_MS);
+    const postRampSeconds = postRampMs / 1000;
+    const postRampDistance =
+      spec.baseSpeed * postRampSeconds * ACCEL_MAX_MULTIPLIER;
+
+    x = rampDistance + postRampDistance;
   } else {
     x = spec.baseSpeed * seconds;
   }
@@ -73,5 +91,5 @@ export function computeDronePosition(
       ? Math.sin((active / ZIGZAG_PERIOD_MS) * Math.PI * 2) * ZIGZAG_AMPLITUDE
       : 0;
 
-  return { x, y };
+  return { x, y, visible: true };
 }

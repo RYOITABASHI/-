@@ -40,6 +40,8 @@ import {
 } from "@/game/phase3d/aimLockOn";
 import type { DroneSpec } from "@/game/types";
 import HUD from "@/game/phase3d/HUD";
+import { ensurePerfTier } from "@/game/phase3d/perfBenchmark";
+import { Spinner } from "@/components/ui/spinner";
 
 export interface LockOnSceneProps {
   questions: ContentItem[];
@@ -79,6 +81,10 @@ const DRONE_Z = 3.5;
 
 const PHASE_TIME_MS = 60_000;
 const HUD_THROTTLE_MS = 66;
+// パネルラベルのDOM更新も低スペック端末のGC/再描画負荷を避けるため同間隔でスロットルする。
+const LABELS_THROTTLE_MS = HUD_THROTTLE_MS;
+// 30fps固定描画。GPU描画(scene.render)のみをこの間隔に間引く(更新ロジックは毎フレーム)。
+const RENDER_INTERVAL_MS = 1000 / 30; // ≒33.3ms
 
 interface PanelLabel {
   key: string;
@@ -104,6 +110,8 @@ export default function LockOnScene({ questions, onComplete }: LockOnSceneProps)
     combo: 0,
   });
   const [labels, setLabels] = useState<PanelLabel[]>([]);
+  // 初回起動時ベンチマーク中はローディングUIを表示する(キャッシュがあれば即座に false)。
+  const [benchmarking, setBenchmarking] = useState(true);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -111,16 +119,27 @@ export default function LockOnScene({ questions, onComplete }: LockOnSceneProps)
 
     const qs = questionsRef.current;
     if (qs.length === 0) {
+      setBenchmarking(false);
       onCompleteRef.current([]);
       return;
     }
 
-    const engine = new Engine(canvas, true, {
-      preserveDrawingBuffer: true,
-      stencil: true,
-    });
-    const scene = new Scene(engine);
-    scene.clearColor = new Color4(0.04, 0.06, 0.1, 1);
+    // 非同期(ベンチマーク→本番シーン構築)。アンマウント時の破棄を disposed で管理する。
+    let disposed = false;
+    let engineForCleanup: Engine | null = null;
+    let sceneForCleanup: Scene | null = null;
+    let handleResize: (() => void) | null = null;
+
+    // 本番シーンを構築する。hardwareScalingLevel はベンチマーク結果を反映する。
+    const buildScene = (hardwareScalingLevel: number) => {
+      const engine = new Engine(canvas, true, {
+        preserveDrawingBuffer: true,
+        stencil: true,
+      });
+      const scene = new Scene(engine);
+      engineForCleanup = engine;
+      sceneForCleanup = scene;
+      scene.clearColor = new Color4(0.04, 0.06, 0.1, 1);
 
     // 環境光 + 1灯のみ(方針)。ここでは環境光1灯のみとし追加ライトは置かない。
     const light = new HemisphericLight("light", new Vector3(0, 1, 0.2), scene);
@@ -195,7 +214,7 @@ export default function LockOnScene({ questions, onComplete }: LockOnSceneProps)
     }
     droneBase.thinInstanceSetBuffer("matrix", droneMatrices, 16);
 
-    engine.setHardwareScalingLevel(2);
+    engine.setHardwareScalingLevel(hardwareScalingLevel);
 
     // 静的シーン構築が完了したのでアクティブメッシュを凍結する。
     scene.freezeActiveMeshes();
@@ -209,6 +228,8 @@ export default function LockOnScene({ questions, onComplete }: LockOnSceneProps)
     let combo = 0;
     let finished = false;
     let lastHudPush = 0;
+    let lastLabelsPush = 0;
+    let lastRenderMs = 0; // 30fps固定描画: 前回 scene.render() 実行時刻。
 
     const forwardRay = new Ray(Vector3.Zero(), Vector3.Zero(), 100);
 
@@ -237,10 +258,19 @@ export default function LockOnScene({ questions, onComplete }: LockOnSceneProps)
     layoutQuestion(0);
 
     // billboard(Y軸まわりでカメラを向く)行列を作りthin instanceへ書き込む。
+    // spawnDelayMs経過前のドローンはスケール0の行列にし、非表示相当にする
+    // (thin instancesはenable/disableを持たないため。座標に依存しないため
+    // 将来カメラ可動域やミニマップ描画範囲が広がっても再出現しない)。
+    const DRONE_HIDDEN_MATRIX = Matrix.Scaling(0, 0, 0);
+
     function updateDrones(elapsed: number) {
       const cam = camera.position;
       for (let i = 0; i < DRONE_SPECS.length; i++) {
         const dp: DronePosition2D = computeDronePosition(DRONE_SPECS[i], elapsed);
+        if (!dp.visible) {
+          DRONE_HIDDEN_MATRIX.copyToArray(droneMatrices, i * 16);
+          continue;
+        }
         const wx =
           DRONE_X_START + (((dp.x % DRONE_X_RANGE) + DRONE_X_RANGE) % DRONE_X_RANGE);
         const wy = DRONE_LANES[i] + dp.y;
@@ -293,6 +323,27 @@ export default function LockOnScene({ questions, onComplete }: LockOnSceneProps)
       }
     }
 
+    // フェーズ制限時間切れ。未回答の残り問題を未命中(不正解)として記録し、一度だけ終了する。
+    function finishByTimeout(now: number) {
+      if (finished) return;
+      for (let i = questionIndex; i < qs.length; i++) {
+        results.push({
+          contentItemId: qs[i].id,
+          hitChoiceId: null,
+          correct: false,
+          // 現在挑戦中の問題は経過時間、以降は未着手として0。
+          timeToLockMs:
+            i === questionIndex ? Math.max(0, Math.round(now - questionStartMs)) : 0,
+          droneHitsTaken: 0,
+        });
+      }
+      questionIndex = qs.length;
+      combo = 0;
+      finished = true;
+      for (const p of panelMeshes) p.setEnabled(false);
+      onCompleteRef.current(results);
+    }
+
     function pushHud(now: number) {
       if (now - lastHudPush < HUD_THROTTLE_MS) return;
       lastHudPush = now;
@@ -308,7 +359,10 @@ export default function LockOnScene({ questions, onComplete }: LockOnSceneProps)
     }
 
     // パネルラベルを画面座標へ射影しDOMオーバーレイへ反映する。
-    function pushLabels(aimedMeshName: string | null) {
+    // 低スペック端末のDOM再描画・GC負荷を避けるためHUDと同間隔でスロットルする。
+    function pushLabels(now: number, aimedMeshName: string | null) {
+      if (now - lastLabelsPush < LABELS_THROTTLE_MS) return;
+      lastLabelsPush = now;
       const item = qs[questionIndex];
       const w = engine.getRenderWidth();
       const h = engine.getRenderHeight();
@@ -339,52 +393,81 @@ export default function LockOnScene({ questions, onComplete }: LockOnSceneProps)
       setLabels(next);
     }
 
+    // レンダーループのコールバックは毎フレーム(rAF周期)実行し、視点更新・ドローン移動・
+    // 照準判定・ロックオン状態更新は毎フレーム行う(入力遅延の最小化)。
+    // GPU描画である scene.render() のみを約33.3ms間隔(30Hz)に間引く。
     engine.runRenderLoop(() => {
+      const now = performance.now();
+
       if (!finished) {
-        const now = performance.now();
-        const elapsed = now - phaseStartMs;
+        // フェーズ制限時間切れ判定(HUD表示だけでなく実際に終了させる)。
+        if (now - phaseStartMs >= PHASE_TIME_MS) {
+          finishByTimeout(now);
+        } else {
+          const elapsed = now - phaseStartMs;
 
-        // レール移動(往復)。カメラ位置のみ更新、回転はプレイヤー操作を維持。
-        const cycle = (elapsed % RAIL_LOOP_MS) / RAIL_LOOP_MS;
-        const tri = cycle < 0.5 ? cycle * 2 : (1 - cycle) * 2; // 0→1→0
-        const railPos = interpolateRailPosition(RAIL_WAYPOINTS, tri);
-        camera.position.set(railPos.x, railPos.y, railPos.z);
+          // レール移動(往復)。カメラ位置のみ更新、回転はプレイヤー操作を維持。
+          const cycle = (elapsed % RAIL_LOOP_MS) / RAIL_LOOP_MS;
+          const tri = cycle < 0.5 ? cycle * 2 : (1 - cycle) * 2; // 0→1→0
+          const railPos = interpolateRailPosition(RAIL_WAYPOINTS, tri);
+          camera.position.set(railPos.x, railPos.y, railPos.z);
 
-        updateDrones(elapsed);
+          updateDrones(elapsed);
 
-        const aimed = pickAimedPanel();
-        aimState = updateAimLockState(
-          aimState,
-          aimed ? aimed.meshName : null,
-          now,
-        );
-
-        // 照準中パネルをハイライト。
-        for (let i = 0; i < MAX_PANELS; i++) {
-          const isAimed = aimed && panelMeshes[i].name === aimed.meshName;
-          panelMats[i].diffuseColor.copyFrom(
-            isAimed ? PANEL_AIM : PANEL_BASE,
+          const aimed = pickAimedPanel();
+          aimState = updateAimLockState(
+            aimState,
+            aimed ? aimed.meshName : null,
+            now,
           );
-        }
 
-        if (aimState.locked && aimed) {
-          recordResult(aimed.choiceId);
-        }
+          // 照準中パネルをハイライト。
+          for (let i = 0; i < MAX_PANELS; i++) {
+            const isAimed = aimed && panelMeshes[i].name === aimed.meshName;
+            panelMats[i].diffuseColor.copyFrom(
+              isAimed ? PANEL_AIM : PANEL_BASE,
+            );
+          }
 
-        pushHud(now);
-        if (!finished) pushLabels(aimed ? aimed.meshName : null);
+          if (aimState.locked && aimed) {
+            recordResult(aimed.choiceId);
+          }
+
+          pushHud(now);
+          if (!finished) pushLabels(now, aimed ? aimed.meshName : null);
+        }
       }
 
-      scene.render();
+      // 30fps固定描画: 前回描画から約33.3ms未満なら scene.render() をスキップする。
+      if (now - lastRenderMs >= RENDER_INTERVAL_MS) {
+        lastRenderMs = now;
+        scene.render();
+      }
     });
 
-    const handleResize = () => engine.resize();
+    handleResize = () => engine.resize();
     window.addEventListener("resize", handleResize);
+    setBenchmarking(false);
+    };
+
+    // マウント時: 本番Engine作成前にベンチマークを実行(初回のみ。キャッシュがあれば即返る)。
+    void (async () => {
+      let hardwareScalingLevel = 2; // 失敗時のフォールバック(方針の中間値)。
+      try {
+        const perf = await ensurePerfTier(() => disposed);
+        hardwareScalingLevel = perf.hardwareScalingLevel;
+      } catch {
+        hardwareScalingLevel = 2;
+      }
+      if (disposed) return;
+      buildScene(hardwareScalingLevel);
+    })();
 
     return () => {
-      window.removeEventListener("resize", handleResize);
-      scene.dispose();
-      engine.dispose();
+      disposed = true;
+      if (handleResize) window.removeEventListener("resize", handleResize);
+      sceneForCleanup?.dispose();
+      engineForCleanup?.dispose();
     };
     // 依存は空: questions/onCompleteはrefで参照する(effectの再実行を避ける)。
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -419,6 +502,15 @@ export default function LockOnScene({ questions, onComplete }: LockOnSceneProps)
         timeRemainingMs={hud.timeRemainingMs}
         combo={hud.combo}
       />
+      {/* 初回起動時の簡易ベンチマーク中の軽量ローディングUI。 */}
+      {benchmarking ? (
+        <div className="absolute inset-0 z-20 flex flex-col items-center justify-center gap-3 bg-slate-950/90 text-white">
+          <Spinner className="size-8 text-cyan-300" />
+          <div className="text-sm font-medium tracking-widest opacity-80">
+            描画品質を計測中...
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }
