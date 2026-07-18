@@ -13,14 +13,21 @@
 //   - カメラ追従の簡易な銃ビューモデル、マズルフラッシュ、リコイル(pitchキック)を追加。
 //   - 効果音は combatAudio.ts(単一AudioContext使い回し)で手続き生成する。
 //
-// 低スペック方針(docs/game-spec.md「想定デバイスと性能方針」)は厳守:
+// 性能方針(docs/game-spec.md「想定デバイスと性能方針」2026-07-18改訂の緩和後の予算)を厳守:
+//   総ポリゴン20万以下 / ドローコール60以下 / テクスチャ1024px以下4枚程度 /
+//   ライトは環境光+2灯まで(本シーンは環境光+方向光1灯の2灯) /
+//   簡易な低解像度シャドウ1灯分(512px, blur exp, 受影は地面のみ)は許容 /
+//   軽量ポストプロセス1つ(単一パスのvignette)は許容 /
 //   setHardwareScalingLevel / freezeActiveMeshes / material.freeze /
-//   シャドウ無し / ポストプロセス無し / 環境光+1灯のみ / おとりはthin instances /
-//   30fps固定描画 / 初回ベンチマーク / 人型敵は低ポリ(1体あたり数百ポリゴン)。
+//   おとりはthin instances / 30fps固定描画 / 初回ベンチマーク /
+//   人型敵は1体あたり1000〜2000ポリゴンを目安(緩和後の余裕を活用)。
 
 import {
   Color3,
   Color4,
+  DefaultRenderingPipeline,
+  DirectionalLight,
+  DynamicTexture,
   Engine,
   FreeCamera,
   HemisphericLight,
@@ -29,8 +36,11 @@ import {
   MeshBuilder,
   Ray,
   Scene,
+  ShadowGenerator,
   StandardMaterial,
+  Texture,
   Vector3,
+  VertexBuffer,
   Viewport,
 } from "@babylonjs/core";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -127,46 +137,250 @@ interface KillingState {
   finishAfter: boolean;
 }
 
-// 低ポリ人型(敵AI兵士)のテンプレートメッシュを手続き生成する。
-// 円柱(胴体)+ 箱(頭部)+ 箱(ヘルメット)を1メッシュにMergeし、以降はcloneや
-// thin instances のベースとして使う。1体あたり数百ポリゴン程度に抑える。
-function buildSoldierTemplate(scene: Scene): Mesh {
-  // 胴体: 8角柱(側面8+上下キャップ)で低ポリ。全高の下部を占める。
-  const body = MeshBuilder.CreateCylinder(
-    "soldierBody",
-    { height: 1.15, diameterTop: 0.42, diameterBottom: 0.5, tessellation: 8 },
+// 迷彩テクスチャ(全兵士で共有)を手続き生成する。
+// 512x512のDynamicTextureにカーキ地+緑/茶/暗色のまだら斑点を描く。まだらは
+// 角ばった多角形ブロブ(不透明・シャープ)にし、旧256pxのぼやけ感を解消する。
+// 全敵で使い回すためドローコール・テクスチャ枚数は増えない(1024px以下・共有1枚)。
+function createCamoTexture(scene: Scene): DynamicTexture {
+  const size = 512;
+  const tex = new DynamicTexture(
+    "camoTex",
+    { width: size, height: size },
+    scene,
+    false,
+  );
+  const ctx = tex.getContext() as unknown as CanvasRenderingContext2D;
+  // 地色: くすんだカーキ。
+  ctx.fillStyle = "#5c6038";
+  ctx.fillRect(0, 0, size, size);
+  // まだら斑(緑・茶・カーキ・暗色)を角ばった多角形で重ねてシャープな迷彩に。
+  const blobColors = ["#6f7347", "#464a29", "#3a3c22", "#7c7a52", "#54502e"];
+  for (let i = 0; i < 340; i++) {
+    ctx.fillStyle = blobColors[i % blobColors.length];
+    const cx = Math.random() * size;
+    const cy = Math.random() * size;
+    const r = 10 + Math.random() * 40;
+    const verts = 5 + Math.floor(Math.random() * 4); // 5〜8角形の不定形。
+    ctx.beginPath();
+    for (let v = 0; v < verts; v++) {
+      const ang = (v / verts) * Math.PI * 2 + Math.random() * 0.5;
+      const rr = r * (0.55 + Math.random() * 0.7);
+      const px = cx + Math.cos(ang) * rr;
+      const py = cy + Math.sin(ang) * rr;
+      if (v === 0) ctx.moveTo(px, py);
+      else ctx.lineTo(px, py);
+    }
+    ctx.closePath();
+    ctx.fill();
+  }
+  tex.update();
+  return tex;
+}
+
+// 地面テクスチャ(土・草地)を手続き生成する。256x256、タイリング前提のノイズ。
+function createGroundTexture(scene: Scene): DynamicTexture {
+  const size = 256;
+  const tex = new DynamicTexture(
+    "groundTex",
+    { width: size, height: size },
+    scene,
+    false,
+  );
+  const ctx = tex.getContext() as unknown as CanvasRenderingContext2D;
+  // 地色: 乾いた土＋草の中間色。
+  ctx.fillStyle = "#4b5334";
+  ctx.fillRect(0, 0, size, size);
+  // 細かな土/草のノイズ斑点。
+  const speckle = ["#3d442a", "#586237", "#6b6e3f", "#414325", "#5f5334"];
+  for (let i = 0; i < 5200; i++) {
+    ctx.fillStyle = speckle[i % speckle.length];
+    const x = Math.random() * size;
+    const y = Math.random() * size;
+    const s = 1 + Math.random() * 3;
+    ctx.fillRect(x, y, s, s);
+  }
+  tex.update();
+  return tex;
+}
+
+// 建物ファサードテクスチャ(窓グリッド)を手続き生成する。壁は明るめの下地にし、
+// 窓を明暗(点灯した暖色 / 消灯した寒色)でランダムに散らして「窓のある建物」に見せる。
+// 頂点カラーで建物ごとに色味を掛け合わせるため、壁色はニュートラルに寄せる。共有1枚。
+function createBuildingTexture(scene: Scene): DynamicTexture {
+  const size = 256;
+  const tex = new DynamicTexture(
+    "bldgTex",
+    { width: size, height: size },
+    scene,
+    false,
+  );
+  const ctx = tex.getContext() as unknown as CanvasRenderingContext2D;
+  // コンクリートの壁面。
+  ctx.fillStyle = "#8a8f98";
+  ctx.fillRect(0, 0, size, size);
+  // 窓グリッド(6列 x 8行)。点灯/消灯をランダムに割り振る。
+  const cols = 6;
+  const rows = 8;
+  const cellW = size / cols;
+  const cellH = size / rows;
+  const winW = cellW * 0.56;
+  const winH = cellH * 0.6;
+  const padX = (cellW - winW) / 2;
+  const padY = (cellH - winH) / 2;
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const lit = Math.random() < 0.4;
+      ctx.fillStyle = lit ? "#ffe6a1" : "#3b4552";
+      ctx.fillRect(c * cellW + padX, r * cellH + padY, winW, winH);
+    }
+  }
+  tex.update();
+  return tex;
+}
+
+// メッシュ全頂点に単一の頂点カラーを焼き込む(Merge時に色情報を保持させるための下ごしらえ)。
+// StandardMaterialは頂点カラーを検出すると自動でテクスチャ/拡散色に乗算する。
+function paintMesh(mesh: Mesh, r: number, g: number, b: number): void {
+  const positions = mesh.getVerticesData(VertexBuffer.PositionKind);
+  if (!positions) return;
+  const count = positions.length / 3;
+  const colors = new Array<number>(count * 4);
+  for (let i = 0; i < count; i++) {
+    colors[i * 4] = r;
+    colors[i * 4 + 1] = g;
+    colors[i * 4 + 2] = b;
+    colors[i * 4 + 3] = 1;
+  }
+  mesh.setVerticesData(VertexBuffer.ColorKind, colors);
+}
+
+// 敵AI兵士に割り当てるマテリアル一式(部位ごとに色/質感を変え、頭部と胴体の
+// コントラストを明確にする)。多重マテリアルMergeで1メッシュ内の別サブメッシュになる。
+interface SoldierMats {
+  camo: StandardMaterial; // 胴体・脚・腕(迷彩テクスチャ)
+  skin: StandardMaterial; // 顔(くすんだタン色。迷彩と明確に差をつける)
+  helmet: StandardMaterial; // ヘルメット(濃色。頭部との境目を強調)
+  gun: StandardMaterial; // 手持ちライフル(ガンメタル)
+}
+
+// 人型(敵AI兵士)メッシュを手続き生成する。脚2本+胴体+頭部(肌色)+ヘルメット(濃色)+
+// 腕2本+手持ちライフルを、部位別マテリアルを付けたまま多重マテリアルMergeで1メッシュ化する。
+// 兵士は -z 側(カメラのいる方向)を正面とし、腕と銃を前面に構える。人体比率を意識し全高約1.8。
+// 1体あたり約200ポリゴン(緩和後予算に対し十分低い)。
+function buildSoldier(scene: Scene, mats: SoldierMats): Mesh {
+  const parts: Mesh[] = [];
+  const add = (m: Mesh, mat: StandardMaterial) => {
+    m.material = mat;
+    parts.push(m);
+  };
+
+  // 脚: 2本の円柱(8角)。接地(y=0)から腰まで。人型の下半身を明示する。
+  for (const sx of [-0.14, 0.14]) {
+    const leg = MeshBuilder.CreateCylinder(
+      "soldierLeg",
+      { height: 0.86, diameterTop: 0.2, diameterBottom: 0.17, tessellation: 8 },
+      scene,
+    );
+    leg.position.set(sx, 0.43, 0);
+    add(leg, mats.camo);
+  }
+
+  // 胴体: 肩に向けて広がる8角柱(下=腰、上=肩)。迷彩(防弾ベスト相当)。
+  const torso = MeshBuilder.CreateCylinder(
+    "soldierTorso",
+    { height: 0.66, diameterTop: 0.52, diameterBottom: 0.42, tessellation: 8 },
     scene,
   );
-  body.position.y = 0.575;
+  torso.position.y = 1.19;
+  add(torso, mats.camo);
 
-  // 頭部: 小さな箱。
-  const head = MeshBuilder.CreateBox(
+  // 首: 短い肌色円柱で頭と胴をつなぎ、頭部の独立感を出す。
+  const neck = MeshBuilder.CreateCylinder(
+    "soldierNeck",
+    { height: 0.1, diameter: 0.16, tessellation: 6 },
+    scene,
+  );
+  neck.position.y = 1.56;
+  add(neck, mats.skin);
+
+  // 頭部(顔): 肌色〜タン色の球体。箱だとブロック状(マイクラ風)に見えるため丸みを持たせる。
+  const head = MeshBuilder.CreateSphere(
     "soldierHead",
-    { width: 0.34, height: 0.34, depth: 0.34 },
+    { diameter: 0.27, segments: 8 },
     scene,
   );
-  head.position.y = 1.32;
+  head.position.y = 1.72;
+  add(head, mats.skin);
 
-  // ヘルメット: 頭部より一回り大きく低い箱を被せる。
-  const helmet = MeshBuilder.CreateBox(
+  // ヘルメット: 頭を覆う一回り大きい球(下半分は頭に隠れ、ドーム状に見える)。濃色。
+  const helmet = MeshBuilder.CreateSphere(
     "soldierHelmet",
-    { width: 0.42, height: 0.2, depth: 0.44 },
+    { diameter: 0.36, segments: 8, slice: 0.62 },
     scene,
   );
-  helmet.position.y = 1.52;
+  helmet.position.y = 1.85;
+  add(helmet, mats.helmet);
 
-  // マテリアルはMerge後にまとめて割り当てるため、ソースには付けない。
+  // 右腕: 肩から前方(-z)へ。円柱(先細り)で丸みを持たせ、銃のグリップを握る形。
+  const rightArm = MeshBuilder.CreateCylinder(
+    "soldierArmR",
+    { height: 0.5, diameterTop: 0.11, diameterBottom: 0.14, tessellation: 8 },
+    scene,
+  );
+  rightArm.position.set(0.28, 1.16, -0.13);
+  rightArm.rotation.x = 0.5;
+  add(rightArm, mats.camo);
+
+  // 左腕: 反対側からフォアグリップへ深く前方に伸ばす円柱。
+  const leftArm = MeshBuilder.CreateCylinder(
+    "soldierArmL",
+    { height: 0.48, diameterTop: 0.11, diameterBottom: 0.14, tessellation: 8 },
+    scene,
+  );
+  leftArm.position.set(-0.15, 1.1, -0.3);
+  leftArm.rotation.x = 0.9;
+  add(leftArm, mats.camo);
+
+  // ライフル レシーバー: 胴体前面に水平に構える。ガンメタル。
+  const rifle = MeshBuilder.CreateBox(
+    "soldierRifle",
+    { width: 0.09, height: 0.11, depth: 0.6 },
+    scene,
+  );
+  rifle.position.set(0.02, 1.19, -0.34);
+  add(rifle, mats.gun);
+
+  // ライフル マガジン: レシーバー下の箱。
+  const rifleMag = MeshBuilder.CreateBox(
+    "soldierRifleMag",
+    { width: 0.06, height: 0.18, depth: 0.09 },
+    scene,
+  );
+  rifleMag.position.set(0.02, 1.03, -0.28);
+  add(rifleMag, mats.gun);
+
+  // ライフル 銃身: 前方へ細い円柱。
+  const rifleBarrel = MeshBuilder.CreateCylinder(
+    "soldierRifleBarrel",
+    { height: 0.3, diameter: 0.04, tessellation: 6 },
+    scene,
+  );
+  rifleBarrel.rotation.x = Math.PI / 2;
+  rifleBarrel.position.set(0.02, 1.19, -0.72);
+  add(rifleBarrel, mats.gun);
+
+  // 部位ごとのマテリアルを保持したまま多重マテリアルでMerge(1メッシュ・サブメッシュ複数)。
   const merged = Mesh.MergeMeshes(
-    [body, head, helmet],
+    parts,
     true, // ソースメッシュを破棄
     true, // 32bitインデックス許可
     undefined,
     false,
-    false,
+    true, // multiMultiMaterials: サブメッシュ+MultiMaterialとしてまとめる
   );
   if (!merged) {
     // Merge失敗時のフォールバック(通常起きない)。胴体だけでも返す。
-    return body;
+    return torso;
   }
   merged.name = "soldierTemplate";
   return merged;
@@ -229,11 +443,49 @@ export default function LockOnScene({ questions, onComplete }: LockOnSceneProps)
       const scene = new Scene(engine);
       engineForCleanup = engine;
       sceneForCleanup = scene;
-      scene.clearColor = new Color4(0.04, 0.06, 0.1, 1);
+      // 屋外の晴天寄りの空色(明るいタクティカルな雰囲気)。フォグ色もこれに合わせる。
+      const SKY_COLOR = new Color3(0.55, 0.68, 0.82);
+      scene.clearColor = new Color4(SKY_COLOR.r, SKY_COLOR.g, SKY_COLOR.b, 1);
 
-      // 環境光 + 1灯のみ(方針)。ここでは環境光1灯のみとし追加ライトは置かない。
+      // 距離フォグで遠景(建物シルエット)を空へ溶かし、奥行きを出す(低コスト)。
+      scene.fogMode = Scene.FOGMODE_LINEAR;
+      scene.fogColor = SKY_COLOR;
+      scene.fogStart = 16;
+      scene.fogEnd = 46;
+
+      // 環境光(1灯目)。屋外の明るい色温度に調整(空=淡い暖色、地面反射=くすんだ緑)。
+      // 方向光を追加したぶん環境光はやや控えめにして陰影を残す。
       const light = new HemisphericLight("light", new Vector3(0, 1, 0.2), scene);
-      light.intensity = 0.95;
+      light.intensity = 0.85;
+      light.diffuse = new Color3(1, 0.97, 0.88);
+      light.groundColor = new Color3(0.42, 0.45, 0.38);
+
+      // 方向光(2灯目)。暖色の太陽光を斜め上手前から当て、モデルに立体感(陰影)を出す。
+      // ライトは環境光+2灯まで許容の範囲内(本シーンは合計2灯)。
+      const sun = new DirectionalLight(
+        "sun",
+        new Vector3(-0.55, -1, 0.35),
+        scene,
+      );
+      sun.position = new Vector3(12, 20, -12);
+      sun.intensity = 1.25;
+      sun.diffuse = new Color3(1, 0.93, 0.78);
+      sun.specular = new Color3(0.2, 0.2, 0.18);
+
+      // 低解像度シャドウ(512px, blur exponential)。1灯分・受影は地面のみに限定して
+      // パフォーマンス影響を最小化する(方針で許容された簡易シャドウ)。
+      const shadowGen = new ShadowGenerator(512, sun);
+      shadowGen.useBlurExponentialShadowMap = true;
+      shadowGen.blurKernel = 16;
+      shadowGen.blurScale = 2;
+      shadowGen.depthScale = 30;
+      sun.shadowMinZ = 1;
+      sun.shadowMaxZ = 40;
+
+      // 全兵士・地面・建物で共有するプロシージャルテクスチャ(1024px以下・計3枚)。
+      const camoTex = createCamoTexture(scene);
+      const groundTex = createGroundTexture(scene);
+      const bldgTex = createBuildingTexture(scene);
 
       // レール移動カメラ。位置はレールで固定し、視点回転のみプレイヤー操作可。
       const camera = new FreeCamera(
@@ -263,77 +515,251 @@ export default function LockOnScene({ questions, onComplete }: LockOnSceneProps)
         scene,
       );
       const groundMat = new StandardMaterial("groundMat", scene);
-      groundMat.diffuseColor = new Color3(0.1, 0.13, 0.18);
+      groundMat.diffuseColor = new Color3(0.85, 0.9, 0.8); // テクスチャを明るく乗せる下地。
       groundMat.specularColor = new Color3(0, 0, 0);
-      groundMat.freeze();
+      // 土・草地テクスチャをタイリング(メッシュ1枚のまま。ドローコール不変)。
+      groundTex.wrapU = Texture.WRAP_ADDRESSMODE;
+      groundTex.wrapV = Texture.WRAP_ADDRESSMODE;
+      groundTex.uScale = 10;
+      groundTex.vScale = 10;
+      groundMat.diffuseTexture = groundTex;
       ground.material = groundMat;
+      // 地面のみをシャドウの受影対象にする(受影1メッシュに限定して負荷を抑える)。
+      // receiveShadows のシェーダ定義を確実に含めるため groundMat は freeze しない。
+      ground.receiveShadows = true;
 
-      // 敵の見た目色(くすんだ迷彩っぽいオリーブ)。命中可能を示すハイライトは emissive で表現。
-      const ENEMY_DIFFUSE = new Color3(0.26, 0.3, 0.17);
-      const ENEMY_EMISSIVE_BASE = new Color3(0.04, 0.05, 0.03);
-      const ENEMY_EMISSIVE_AIM = new Color3(0.08, 0.4, 0.45); // 照準が乗った時のシアン寄り発光。
+      // 遠景の建物群。ビル本体(窓テクスチャ+頂点カラーで色味に変化)と切妻風の屋根を
+      // それぞれ1メッシュにMergeし、背景を計2ドローコールに抑える。フォグで空へ溶ける。
+      // [x, z, width, height, depth, tintR, tintG, tintB, roof(1=切妻/0=陸屋根)]
+      const buildingLayout: Array<
+        [number, number, number, number, number, number, number, number, number]
+      > = [
+        [-16, 34, 6, 9, 5, 0.85, 0.83, 0.8, 1],
+        [-8, 40, 5, 13, 5, 0.7, 0.74, 0.82, 0],
+        [2, 42, 7, 8, 6, 0.9, 0.82, 0.72, 1],
+        [12, 38, 5, 15, 5, 0.66, 0.7, 0.78, 0],
+        [19, 33, 6, 10, 5, 0.82, 0.78, 0.72, 1],
+        [-22, 30, 5, 7, 5, 0.78, 0.8, 0.85, 1],
+        [8, 46, 6, 18, 6, 0.6, 0.64, 0.72, 0],
+        [-2, 48, 5, 11, 5, 0.86, 0.8, 0.74, 1],
+      ];
+      const buildingBoxes: Mesh[] = [];
+      const roofPrisms: Mesh[] = [];
+      for (let i = 0; i < buildingLayout.length; i++) {
+        const [bx, bz, bw, bh, bd, tr, tg, tb, roof] = buildingLayout[i];
+        const box = MeshBuilder.CreateBox(
+          `bldg-${i}`,
+          { width: bw, height: bh, depth: bd },
+          scene,
+        );
+        box.position.set(bx, bh / 2, bz);
+        paintMesh(box, tr, tg, tb); // 建物ごとの色味を頂点カラーで焼き込む。
+        buildingBoxes.push(box);
 
-      // 選択肢の敵AI兵士(pool)。人型メッシュを個別に生成し、各自にマテリアルとメタデータを持たせる。
-      // (thin instancesベースとジオメトリを共有しないよう clone は使わず個別生成する。
-      //  共有ジオメトリにthin instanceバッファを載せるとcloneの描画が壊れうるため。)
+        if (roof === 1) {
+          // 切妻屋根: 3角柱(tessellation:3の円柱)を横倒しにして屋根に見立てる。
+          const prism = MeshBuilder.CreateCylinder(
+            `roof-${i}`,
+            {
+              height: bd,
+              diameter: bw * 1.02,
+              tessellation: 3,
+            },
+            scene,
+          );
+          // 円柱の軸(y)を奥行き(z)方向へ倒し、稜線が水平になるよう回す。
+          prism.rotation.x = Math.PI / 2;
+          prism.rotation.y = Math.PI / 6;
+          prism.position.set(bx, bh + bw * 0.25, bz);
+          paintMesh(prism, tr * 0.7, tg * 0.55, tb * 0.5); // 屋根は暗い赤茶寄りに。
+          roofPrisms.push(prism);
+        }
+      }
+      const buildings = Mesh.MergeMeshes(buildingBoxes, true, true);
+      if (buildings) {
+        buildings.name = "buildings";
+        buildings.isPickable = false;
+        const bldgMat = new StandardMaterial("bldgMat", scene);
+        bldgMat.diffuseColor = new Color3(1, 1, 1); // 頂点カラー/窓テクスチャを素直に乗せる。
+        bldgMat.diffuseTexture = bldgTex; // 共有の窓ファサードテクスチャ。
+        bldgMat.specularColor = new Color3(0, 0, 0);
+        bldgMat.freeze();
+        buildings.material = bldgMat;
+      }
+      const roofs = Mesh.MergeMeshes(roofPrisms, true, true);
+      if (roofs) {
+        roofs.name = "roofs";
+        roofs.isPickable = false;
+        const roofMat = new StandardMaterial("roofMat", scene);
+        roofMat.diffuseColor = new Color3(1, 1, 1); // 屋根色は頂点カラーで表現。
+        roofMat.specularColor = new Color3(0, 0, 0);
+        roofMat.freeze();
+        roofs.material = roofMat;
+      }
+
+      // 敵の各部位色。迷彩は明るめ白寄りの下地にテクスチャを乗算。顔=タン、ヘルメット=濃色。
+      // 命中可能を示すハイライトは迷彩/顔/ヘルメットの emissive を一括で切り替えて表現する。
+      const ENEMY_DIFFUSE = new Color3(0.95, 0.95, 0.9);
+      const ENEMY_SKIN = new Color3(0.74, 0.58, 0.44); // くすんだタン色の顔。
+      const ENEMY_HELMET = new Color3(0.16, 0.19, 0.13); // 濃いオリーブのヘルメット。
+      const ENEMY_EMISSIVE_BASE = new Color3(0.02, 0.03, 0.02);
+      const ENEMY_EMISSIVE_AIM = new Color3(0.1, 0.5, 0.55); // 照準が乗った時のシアン寄り発光。
+
+      // 迷彩を共有しつつ照準ハイライトは個別に切り替えられるよう、部位別マテリアルを生成する
+      // 小ヘルパ。迷彩テクスチャは全マテリアルで共有(テクスチャ枚数・ドローコールは増やさない)。
+      const makeSoldierMats = (
+        tag: string,
+        tint: number,
+        emissive: Color3,
+      ): SoldierMats => {
+        const camo = new StandardMaterial(`camoMat-${tag}`, scene);
+        camo.diffuseColor = ENEMY_DIFFUSE.scale(tint);
+        camo.diffuseTexture = camoTex;
+        camo.emissiveColor = emissive.clone();
+        camo.specularColor = new Color3(0, 0, 0);
+        const skin = new StandardMaterial(`skinMat-${tag}`, scene);
+        skin.diffuseColor = ENEMY_SKIN.scale(tint);
+        skin.emissiveColor = emissive.clone();
+        skin.specularColor = new Color3(0.05, 0.05, 0.05);
+        const helmet = new StandardMaterial(`helmetMat-${tag}`, scene);
+        helmet.diffuseColor = ENEMY_HELMET.scale(tint);
+        helmet.emissiveColor = emissive.clone();
+        helmet.specularColor = new Color3(0.08, 0.08, 0.08);
+        const gun = new StandardMaterial(`enemyGunMat-${tag}`, scene);
+        gun.diffuseColor = new Color3(0.13, 0.14, 0.15);
+        gun.emissiveColor = new Color3(0.01, 0.01, 0.012);
+        gun.specularColor = new Color3(0.1, 0.1, 0.12);
+        return { camo, skin, helmet, gun };
+      };
+
+      // 選択肢の敵AI兵士(pool)。人型メッシュを個別に生成し、各自にマテリアル群とメタデータを持たせる。
+      // (thin instancesベースとジオメトリを共有しないよう clone は使わず個別生成する。)
       const enemyMeshes: Mesh[] = [];
-      const enemyMats: StandardMaterial[] = [];
+      // 照準ハイライトで emissive を書き換える部位マテリアル群(迷彩/顔/ヘルメット)。
+      const enemyHiliteMats: StandardMaterial[][] = [];
       for (let i = 0; i < MAX_ENEMIES; i++) {
-        const enemy = buildSoldierTemplate(scene);
+        const mats = makeSoldierMats(`enemy-${i}`, 1, ENEMY_EMISSIVE_BASE);
+        const enemy = buildSoldier(scene, mats);
         enemy.name = `enemy-${i}`;
-        // マテリアルはハイライトで emissive を書き換えるため freeze しない。
-        const mat = new StandardMaterial(`enemyMat-${i}`, scene);
-        mat.diffuseColor = ENEMY_DIFFUSE.clone();
-        mat.emissiveColor = ENEMY_EMISSIVE_BASE.clone();
-        mat.specularColor = new Color3(0, 0, 0);
-        enemy.material = mat;
         enemy.metadata = { isEnemy: true, choiceId: null as string | null };
+        shadowGen.addShadowCaster(enemy); // 敵は影を落とす(受影は地面のみ)。
         enemyMeshes.push(enemy);
-        enemyMats.push(mat);
+        enemyHiliteMats.push([mats.camo, mats.skin, mats.helmet]);
       }
 
       // おとりの敵: 独立した人型メッシュをベースにし、thin instances で3体を描画する。
-      // 選択肢を持たず、撃ってもミス扱い(ピック対象にしない)。
-      const decoyBase = buildSoldierTemplate(scene);
+      // 選択肢を持たず、撃ってもミス扱い(ピック対象にしない)。部位別マテリアルはやや暗く固定。
+      const decoyMats = makeSoldierMats("decoy", 0.62, new Color3(0.02, 0.02, 0.02));
+      decoyMats.camo.freeze();
+      decoyMats.skin.freeze();
+      decoyMats.helmet.freeze();
+      decoyMats.gun.freeze();
+      const decoyBase = buildSoldier(scene, decoyMats);
       decoyBase.name = "decoyBase";
       decoyBase.isPickable = false;
-      const decoyMat = new StandardMaterial("decoyMat", scene);
-      decoyMat.diffuseColor = new Color3(0.22, 0.2, 0.16); // おとりは僅かに暗い色。
-      decoyMat.emissiveColor = new Color3(0.03, 0.03, 0.02);
-      decoyMat.specularColor = new Color3(0, 0, 0);
-      decoyMat.freeze();
-      decoyBase.material = decoyMat;
+      shadowGen.addShadowCaster(decoyBase); // おとりも影を落とす(thin instances対応)。
       const decoyMatrices = new Float32Array(DRONE_SPECS.length * 16);
       for (let i = 0; i < DRONE_SPECS.length; i++) {
         Matrix.Identity().copyToArray(decoyMatrices, i * 16);
       }
       decoyBase.thinInstanceSetBuffer("matrix", decoyMatrices, 16);
 
-      // 銃ビューモデル(カメラ追従)。Box/Cylinderを1メッシュにMergeし右下寄りに配置する。
-      // ピック対象にはしない。
-      const gunBody = MeshBuilder.CreateBox(
-        "gunBody",
-        { width: 0.12, height: 0.14, depth: 0.6 },
+      // 銃ビューモデル(カメラ追従)。ストック/レシーバー/ピストルグリップ/トリガーガード/
+      // マガジン(前傾)/ハンドガード/フォアグリップ/銃身/サイトを箱・円柱で組み、Mergeで
+      // 1メッシュに。ライフルを構えたシルエットが分かる形にしつつ、視界を遮らないよう
+      // 前回より一回り小さくして右下に程よく収める。ローカル+z=前方(銃口方向)。ピック対象外。
+      const gunParts: Mesh[] = [];
+      // レシーバー(本体)。
+      const gunReceiver = MeshBuilder.CreateBox(
+        "gunReceiver",
+        { width: 0.13, height: 0.15, depth: 0.62 },
         scene,
       );
-      gunBody.position.set(0, 0, 0.1);
+      gunReceiver.position.set(0, 0, 0.05);
+      gunParts.push(gunReceiver);
+      // ストック: レシーバー後方(手前)へ、肩付け方向にやや下げて。
+      const gunStock = MeshBuilder.CreateBox(
+        "gunStock",
+        { width: 0.1, height: 0.14, depth: 0.3 },
+        scene,
+      );
+      gunStock.position.set(0, -0.06, -0.42);
+      gunStock.rotation.x = -0.08;
+      gunParts.push(gunStock);
+      // ピストルグリップ: レシーバー下後方へ斜めに下ろす。
+      const gunGrip = MeshBuilder.CreateBox(
+        "gunGrip",
+        { width: 0.08, height: 0.22, depth: 0.1 },
+        scene,
+      );
+      gunGrip.position.set(0, -0.16, -0.16);
+      gunGrip.rotation.x = -0.5;
+      gunParts.push(gunGrip);
+      // トリガーガード: グリップ前方の小さな薄い箱(輪の代用)。
+      const gunTrigger = MeshBuilder.CreateBox(
+        "gunTrigger",
+        { width: 0.05, height: 0.08, depth: 0.12 },
+        scene,
+      );
+      gunTrigger.position.set(0, -0.11, -0.05);
+      gunParts.push(gunTrigger);
+      // マガジン: レシーバー下に前傾(下向きに斜め)で差し込む。
+      const gunMag = MeshBuilder.CreateBox(
+        "gunMag",
+        { width: 0.07, height: 0.26, depth: 0.14 },
+        scene,
+      );
+      gunMag.position.set(0, -0.2, 0.04);
+      gunMag.rotation.x = 0.3;
+      gunParts.push(gunMag);
+      // ハンドガード: レシーバー前方の細い箱。
+      const gunHandguard = MeshBuilder.CreateBox(
+        "gunHandguard",
+        { width: 0.09, height: 0.09, depth: 0.36 },
+        scene,
+      );
+      gunHandguard.position.set(0, -0.005, 0.5);
+      gunParts.push(gunHandguard);
+      // フォアグリップ: ハンドガード下に垂直の短い持ち手。
+      const gunForegrip = MeshBuilder.CreateBox(
+        "gunForegrip",
+        { width: 0.05, height: 0.14, depth: 0.06 },
+        scene,
+      );
+      gunForegrip.position.set(0, -0.11, 0.46);
+      gunParts.push(gunForegrip);
+      // 銃身: ハンドガード先端から前方へ。
       const gunBarrel = MeshBuilder.CreateCylinder(
         "gunBarrel",
-        { height: 0.5, diameter: 0.05, tessellation: 6 },
+        { height: 0.44, diameter: 0.05, tessellation: 6 },
         scene,
       );
       gunBarrel.rotation.x = Math.PI / 2; // 前方(z+)へ向ける。
-      gunBarrel.position.set(0, 0.02, 0.5);
-      const gunMag = MeshBuilder.CreateBox(
-        "gunMag",
-        { width: 0.08, height: 0.22, depth: 0.14 },
+      gunBarrel.position.set(0, 0.005, 0.82);
+      gunParts.push(gunBarrel);
+      // リアサイト: レシーバー後方上面の小さな箱。
+      const gunRearSight = MeshBuilder.CreateBox(
+        "gunRearSight",
+        { width: 0.05, height: 0.07, depth: 0.05 },
         scene,
       );
-      gunMag.position.set(0, -0.16, 0.05);
-      const gun = Mesh.MergeMeshes([gunBody, gunBarrel, gunMag], true, true);
+      gunRearSight.position.set(0, 0.11, -0.12);
+      gunParts.push(gunRearSight);
+      // フロントサイト: 銃身付け根上面の細い箱。
+      const gunFrontSight = MeshBuilder.CreateBox(
+        "gunFrontSight",
+        { width: 0.03, height: 0.09, depth: 0.03 },
+        scene,
+      );
+      gunFrontSight.position.set(0, 0.11, 0.56);
+      gunParts.push(gunFrontSight);
+      const gun = Mesh.MergeMeshes(gunParts, true, true);
+      // ダークガンメタル調(迷彩は乗せず単色でシルエットを締める)。方向光でハイライトが出る。
       const gunMat = new StandardMaterial("gunMat", scene);
-      gunMat.diffuseColor = new Color3(0.12, 0.12, 0.14);
-      gunMat.specularColor = new Color3(0.05, 0.05, 0.05);
+      gunMat.diffuseColor = new Color3(0.15, 0.16, 0.18);
+      gunMat.specularColor = new Color3(0.35, 0.36, 0.4); // 金属的なハイライト。
+      gunMat.specularPower = 48;
+      gunMat.emissiveColor = new Color3(0.015, 0.015, 0.02);
       gunMat.freeze();
       let muzzle: Mesh | null = null;
       if (gun) {
@@ -341,15 +767,17 @@ export default function LockOnScene({ questions, onComplete }: LockOnSceneProps)
         gun.material = gunMat;
         gun.isPickable = false;
         gun.parent = camera;
-        // 画面右下寄り、前方に配置(一人称の構え)。
-        gun.position.set(0.28, -0.28, 0.9);
-        gun.rotation.set(0.02, -0.04, 0);
+        shadowGen.addShadowCaster(gun); // 銃も地面に簡易な影を落とす。
+        // 画面右下寄り。前回よりやや小さく・下げて視界の邪魔を減らす。
+        gun.position.set(0.3, -0.34, 0.78);
+        gun.rotation.set(0.04, -0.05, 0);
+        gun.scaling.setAll(0.9);
 
-        // マズルフラッシュ: 銃口付近の小さな発光プレーン。発射時のみ短時間表示する。
-        muzzle = MeshBuilder.CreatePlane("muzzle", { size: 0.28 }, scene);
+        // マズルフラッシュ: 銃口付近の発光プレーン。発射時のみ短時間表示する。
+        muzzle = MeshBuilder.CreatePlane("muzzle", { size: 0.4 }, scene);
         const muzzleMat = new StandardMaterial("muzzleMat", scene);
         muzzleMat.diffuseColor = new Color3(0, 0, 0);
-        muzzleMat.emissiveColor = new Color3(1, 0.8, 0.35);
+        muzzleMat.emissiveColor = new Color3(1, 0.85, 0.45);
         muzzleMat.specularColor = new Color3(0, 0, 0);
         muzzleMat.backFaceCulling = false;
         muzzleMat.disableLighting = true;
@@ -357,13 +785,35 @@ export default function LockOnScene({ questions, onComplete }: LockOnSceneProps)
         muzzle.material = muzzleMat;
         muzzle.isPickable = false;
         muzzle.parent = camera;
-        muzzle.position.set(0.28, -0.24, 1.45); // 銃口の少し前。
+        muzzle.position.set(0.3, -0.3, 1.6); // 銃口の少し前。
         muzzle.setEnabled(false);
       }
+
+      // 軽量ポストプロセス(1つまで許容): 単一パスのvignetteのみ。画面端を少し暗くして
+      // タクティカルな没入感を出す。ブルーム/被写界深度/モーションブラー等は無効のまま。
+      const pipeline = new DefaultRenderingPipeline(
+        "postfx",
+        false, // HDR不要(軽量化)。
+        scene,
+        [camera],
+      );
+      pipeline.bloomEnabled = false;
+      pipeline.depthOfFieldEnabled = false;
+      pipeline.chromaticAberrationEnabled = false;
+      pipeline.grainEnabled = false;
+      pipeline.fxaaEnabled = false;
+      pipeline.samples = 1;
+      pipeline.imageProcessingEnabled = true;
+      pipeline.imageProcessing.vignetteEnabled = true;
+      pipeline.imageProcessing.vignetteWeight = 2.6;
+      pipeline.imageProcessing.vignetteColor = new Color4(0, 0, 0, 0);
+      pipeline.imageProcessing.vignetteCameraFov = 0.9;
+      // トーンマッピングやコントラスト補正で色味が変わらないよう既定のまま(vignetteだけ有効)。
 
       engine.setHardwareScalingLevel(hardwareScalingLevel);
 
       // 静的シーン構築が完了したのでアクティブメッシュを凍結する。
+      // (シャドウマップは専用のrenderListで描画するため freezeActiveMeshes と両立する。)
       scene.freezeActiveMeshes();
 
       // ---- ミッション進行状態(ループ内で更新するref) ----
@@ -409,7 +859,9 @@ export default function LockOnScene({ questions, onComplete }: LockOnSceneProps)
             enemy.setEnabled(false);
             (enemy.metadata as { choiceId: string | null }).choiceId = null;
           }
-          enemyMats[i].emissiveColor.copyFrom(ENEMY_EMISSIVE_BASE);
+          for (const m of enemyHiliteMats[i]) {
+            m.emissiveColor.copyFrom(ENEMY_EMISSIVE_BASE);
+          }
         }
         questionStartMs = performance.now();
         missShotsThisQuestion = 0;
@@ -682,12 +1134,15 @@ export default function LockOnScene({ questions, onComplete }: LockOnSceneProps)
             } else {
               const aimed = pickAimedEnemy();
 
-              // 照準が乗っている敵をハイライト(emissive)。
+              // 照準が乗っている敵をハイライト(迷彩/顔/ヘルメットの emissive を一括切替)。
               for (let i = 0; i < MAX_ENEMIES; i++) {
                 const isAimed = aimed && enemyMeshes[i].name === aimed.meshName;
-                enemyMats[i].emissiveColor.copyFrom(
-                  isAimed ? ENEMY_EMISSIVE_AIM : ENEMY_EMISSIVE_BASE,
-                );
+                const target = isAimed
+                  ? ENEMY_EMISSIVE_AIM
+                  : ENEMY_EMISSIVE_BASE;
+                for (const m of enemyHiliteMats[i]) {
+                  m.emissiveColor.copyFrom(target);
+                }
               }
 
               // 発射要求の消費(クールダウンはhandleFire内で判定)。
