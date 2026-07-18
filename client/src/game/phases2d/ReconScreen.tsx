@@ -23,17 +23,6 @@ export interface ReconScreenProps {
   onComplete: (results: ReconPhaseResult[]) => void;
 }
 
-const COMPASS_LABEL_JA: Record<CompassDirection, string> = {
-  N: "北",
-  NE: "北東",
-  E: "東",
-  SE: "南東",
-  S: "南",
-  SW: "南西",
-  W: "西",
-  NW: "北西",
-};
-
 /** compass rose上の配置(3x3グリッド、1始まり)。 */
 const GRID_POSITION: Record<CompassDirection, { row: number; col: number }> = {
   N: { row: 1, col: 2 },
@@ -46,16 +35,32 @@ const GRID_POSITION: Record<CompassDirection, { row: number; col: number }> = {
   NW: { row: 1, col: 1 },
 };
 
-function pickRandomDirection(): CompassDirection {
-  const idx = Math.floor(Math.random() * COMPASS_DIRECTIONS.length);
-  return COMPASS_DIRECTIONS[idx];
+/** 選択肢それぞれに、重複しない方位をランダムに割り当てる(Fisher-Yates)。 */
+function assignDirectionsToChoices(
+  choiceIds: string[],
+): Record<string, CompassDirection> {
+  const shuffled = [...COMPASS_DIRECTIONS];
+  for (let i = shuffled.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+  }
+  const picked = shuffled.slice(0, choiceIds.length);
+  const map: Record<string, CompassDirection> = {};
+  choiceIds.forEach((id, i) => {
+    map[id] = picked[i];
+  });
+  return map;
 }
 
 export default function ReconScreen({ questions, onComplete }: ReconScreenProps) {
   const [index, setIndex] = useState(0);
   const [results, setResults] = useState<ReconPhaseResult[]>([]);
-  const [correctDirection, setCorrectDirection] = useState<CompassDirection>(() =>
-    pickRandomDirection(),
+  // 選択肢id -> 割り当てられた方位。ボタンにはこの方位の位置へ選択肢のテキストを表示する。
+  const [choiceDirections, setChoiceDirections] = useState<
+    Record<string, CompassDirection>
+  >({});
+  const [correctDirection, setCorrectDirection] = useState<CompassDirection | null>(
+    null,
   );
   const [presentedAt, setPresentedAt] = useState<number>(() => Date.now());
   const [pulseVisible, setPulseVisible] = useState(false);
@@ -72,11 +77,13 @@ export default function ReconScreen({ questions, onComplete }: ReconScreenProps)
 
   useEffect(() => {
     if (!current) return;
-    const direction = pickRandomDirection();
-    setCorrectDirection(direction);
+    const map = assignDirectionsToChoices(current.choices.map((c) => c.id));
+    const correctDir = map[current.correctChoiceId] ?? null;
+    setChoiceDirections(map);
+    setCorrectDirection(correctDir);
     setPresentedAt(Date.now());
-    triggerCue(direction);
-    // 問題(index)が変わるたびに新しい方位を割り当て、音を鳴らす。
+    if (correctDir) triggerCue(correctDir);
+    // 問題(index)が変わるたびに選択肢と方位を割り当て直し、正解の方向から音を鳴らす。
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [index, current?.id]);
 
@@ -87,6 +94,7 @@ export default function ReconScreen({ questions, onComplete }: ReconScreenProps)
   }
 
   function handleReplay() {
+    if (!correctDirection) return;
     setPresentedAt(Date.now());
     triggerCue(correctDirection);
   }
@@ -115,13 +123,22 @@ export default function ReconScreen({ questions, onComplete }: ReconScreenProps)
   if (!current) return null;
 
   const progressPct = Math.round((index / questions.length) * 100);
+  // 方位 -> この方位に割り当てられた選択肢、の逆引き。ボタンには選択肢のテキストを表示する。
+  const directionToChoice = new Map<
+    CompassDirection,
+    { id: string; label: string }
+  >();
+  for (const choice of current.choices) {
+    const dir = choiceDirections[choice.id];
+    if (dir) directionToChoice.set(dir, choice);
+  }
 
   return (
     <div className="flex min-h-svh flex-col gap-4 p-4 sm:p-6">
       <div>
         <h1 className="text-xl font-bold sm:text-2xl">索敵</h1>
         <p className="text-sm text-muted-foreground">
-          課題文を読み、方位音が聞こえた方角のパネルを選んでください。
+          課題文を読み、正しい答えのパネルを選んでください。方位音は正解の方向のヒントです。
         </p>
         <Progress value={progressPct} className="mt-2" />
         <p className="mt-1 text-xs text-muted-foreground">
@@ -140,10 +157,11 @@ export default function ReconScreen({ questions, onComplete }: ReconScreenProps)
             <div
               className="relative grid aspect-square w-full max-w-xs grid-cols-3 grid-rows-3 gap-1.5"
               role="group"
-              aria-label="方位選択"
+              aria-label="選択肢"
             >
               {COMPASS_DIRECTIONS.map((direction) => {
                 const pos = GRID_POSITION[direction];
+                const choice = directionToChoice.get(direction);
                 const isPulsing = pulseVisible && direction === correctDirection;
                 return (
                   <div
@@ -162,15 +180,17 @@ export default function ReconScreen({ questions, onComplete }: ReconScreenProps)
                         />
                       )}
                     </AnimatePresence>
-                    <Button
-                      type="button"
-                      variant={direction === "N" ? "secondary" : "outline"}
-                      size="sm"
-                      onClick={() => handleSelect(direction)}
-                      className="relative h-14 w-14 flex-col gap-0 rounded-full text-xs"
-                    >
-                      {COMPASS_LABEL_JA[direction]}
-                    </Button>
+                    {choice && (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        onClick={() => handleSelect(direction)}
+                        className="relative h-16 w-16 flex-col gap-0 whitespace-normal break-words rounded-full p-1 text-[11px] leading-tight"
+                      >
+                        {choice.label}
+                      </Button>
+                    )}
                   </div>
                 );
               })}
