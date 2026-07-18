@@ -3,26 +3,49 @@
 // [担当: task_3d_core] ③交戦フェーズ(3Dレール視点)。旧称ロックオンフェーズ。
 // レール移動+視点操作のみ(自由移動なし)。狙って撃つ明示的発射を中核に据える。
 //
-// FPS化(2026-07-17改訂の game-spec.md に対応)での主な変更:
-//   - 旧「照準0.3秒保持で自動ロックオン(aimLockOn)」を廃止し、発射ボタン/
-//     スペースキー/マウス左クリックによる明示的発射に変更(発射クールダウン付き)。
-//   - 選択肢は幾何パネルではなく低ポリの人型「敵AI兵士」で表現する
-//     (円柱の胴体+箱の頭部/ヘルメットを手続き生成しMergeで1メッシュ化)。
-//   - 妨害ドローンは同じ人型シルエットの thin instances で「おとりの敵」として
-//     droneAI.ts の移動パターンをそのままパトロールさせる(撃つとミス扱い)。
-//   - カメラ追従の簡易な銃ビューモデル、マズルフラッシュ、リコイル(pitchキック)を追加。
+// 2026-07-18改訂(既製CC0モデル導入):
+//   - 敵AI兵士・銃ビューモデルを、従来の手続き生成ジオメトリ(Box/Cylinder/Sphere)から
+//     既製のCC0(パブリックドメイン)3Dモデルの読み込みへ置き換えた。
+//       * 敵AI兵士: Quaternius「Ultimate Modular Men Pack」の SWAT キャラクター
+//         (/models/swat-soldier.glb, スケルタル・アニメーション付き)。
+//       * 銃ビューモデル: Quaternius「Assault Rifle」(/models/assault-rifle.glb)。
+//   - モデルは初回に1度だけ読み込み、テンプレートを clone して選択肢4体・おとり3体に使う。
+//   - SWATは1体9サブメッシュ(=9ドローコール)あるため、テンプレートを多重マテリアルMerge
+//     (multiMultiMaterials)で 1メッシュ・4サブメッシュに畳んでドローコールを抑える
+//     (7体×4=28ドローコール。緩和後予算60以下に収める)。
+//   - スケルトンは全クローンで共有し、Idle_Gun アニメーションをループ再生して立ち姿に生気を出す
+//     (共有のため骨行列計算は1体分で済む)。撃破は従来同様のノードtween(Y縮小+傾き)。
+//   - 照準判定は、スケルタルメッシュのレイ判定ブレを避けるため各敵に不可視のピック用
+//     コライダーボックスを持たせ、そこにメタデータを載せる(可視メッシュは isPickable=false)。
+//   - 読み込み失敗時は簡易な手続き生成兵士へフォールバックし、画面が真っ白にならないようにする。
+//
+// FPS化(2026-07-17改訂の game-spec.md に対応)での主な変更(継続):
+//   - 明示的発射(発射ボタン/スペース/左クリック, クールダウン付き)。自動ロックオン廃止。
+//   - おとりの敵(妨害ドローン相当)は droneAI.ts の移動パターンでパトロールさせる(撃つとミス)。
+//   - カメラ追従の銃ビューモデル、マズルフラッシュ、リコイル(pitchキック)。
 //   - 効果音は combatAudio.ts(単一AudioContext使い回し)で手続き生成する。
 //
 // 性能方針(docs/game-spec.md「想定デバイスと性能方針」2026-07-18改訂の緩和後の予算)を厳守:
 //   総ポリゴン20万以下 / ドローコール60以下 / テクスチャ1024px以下4枚程度 /
 //   ライトは環境光+2灯まで(本シーンは環境光+方向光1灯の2灯) /
-//   簡易な低解像度シャドウ1灯分(512px, blur exp, 受影は地面のみ)は許容 /
+//   簡易な低解像度シャドウ1灯分(512px, blur exp, 受影は地面のみ / 投影は選択肢の敵のみ) /
 //   軽量ポストプロセス1つ(単一パスのvignette)は許容 /
 //   setHardwareScalingLevel / freezeActiveMeshes / material.freeze /
-//   おとりはthin instances / 30fps固定描画 / 初回ベンチマーク /
-//   人型敵は1体あたり1000〜2000ポリゴンを目安(緩和後の余裕を活用)。
+//   30fps固定描画 / 初回ベンチマーク。
+//   実測: SWAT=7,752三角形/体, ライフル=1,930三角形。敵最大7体で約5.4万三角形(予算20万に十分収まる)。
 
+// glTFローダーをサイドエフェクト登録する(SceneLoaderで.glbを読むのに必須)。
+// 注意: バレル "@babylonjs/loaders/glTF" は全拡張(KHR_interactivity 等)を取り込み、
+// loaders@7.40.0 と core@7.54.3 のバージョン差で存在しないモジュール
+// (FlowGraph/.../flowGraphTimerBlock.js)を参照してビルドが壊れる。
+// 本シーンの2つの .glb はどちらも glTF拡張を一切使わないため、プラグイン登録
+// (glTFFileLoader)と2.0ローダー本体(glTFLoader)だけを読み込み、壊れた拡張バレルを避ける。
+import "@babylonjs/loaders/glTF/glTFFileLoader";
+import "@babylonjs/loaders/glTF/2.0/glTFLoader";
 import {
+  AbstractMesh,
+  AnimationGroup,
+  AssetContainer,
   Color3,
   Color4,
   DefaultRenderingPipeline,
@@ -34,11 +57,15 @@ import {
   Matrix,
   Mesh,
   MeshBuilder,
+  MultiMaterial,
+  PBRMaterial,
   Ray,
   Scene,
+  SceneLoader,
   ShadowGenerator,
   StandardMaterial,
   Texture,
+  TransformNode,
   Vector3,
   VertexBuffer,
   Viewport,
@@ -82,8 +109,15 @@ const RAIL_LOOP_MS = 8000; // 片道4秒で往復。
 const MAX_ENEMIES = 4;
 const ENEMY_Z = 6;
 const ENEMY_SPREAD = 2.6;
-// 敵の頭上に出すネームタグ(選択肢テキスト)の高さ。人型の全高(約1.6)より少し上。
-const LABEL_Y = 1.95;
+// 敵の頭上に出すネームタグ(選択肢テキスト)の高さ。人型モデルの全高(約1.75)より少し上。
+const LABEL_Y = 2.05;
+
+// 読み込んだ人型モデルを合わせる目標身長(ワールド単位)。地面 y=0 に足を接地させる。
+const TARGET_HEIGHT = 1.75;
+// 兵士の正面向き(rotation.y)。SWATの正面がカメラ(-z側)を向くよう調整する。
+const SOLDIER_FACING_Y = Math.PI;
+// ピック用コライダーの寸法(人型の胴〜頭を覆う。可視化しない)。
+const COLLIDER_SIZE = { width: 0.7, height: 1.75, depth: 0.5 };
 
 // おとりの敵(妨害ドローン相当)。等速→加速→ジグザグを1体ずつ。撃つとミス扱い。
 const DRONE_SPECS: DroneSpec[] = [
@@ -120,6 +154,10 @@ const RECOIL_KICK_RAD = (1.4 * Math.PI) / 180;
 // リコイル回復速度(rad/ms)。1発分を約0.5秒で戻す。連射しなければ0に収束する。
 const RECOIL_RECOVER_PER_MS = RECOIL_KICK_RAD / 500;
 
+// 照準ハイライト(命中可能を示す)。emissiveを一括で切り替えて表現する。
+const ENEMY_EMISSIVE_BASE = new Color3(0, 0, 0);
+const ENEMY_EMISSIVE_AIM = new Color3(0.14, 0.6, 0.66); // 照準が乗った時のシアン寄り発光。
+
 interface EnemyLabel {
   key: string;
   text: string;
@@ -137,44 +175,23 @@ interface KillingState {
   finishAfter: boolean;
 }
 
-// 迷彩テクスチャ(全兵士で共有)を手続き生成する。
-// 512x512のDynamicTextureにカーキ地+緑/茶/暗色のまだら斑点を描く。まだらは
-// 角ばった多角形ブロブ(不透明・シャープ)にし、旧256pxのぼやけ感を解消する。
-// 全敵で使い回すためドローコール・テクスチャ枚数は増えない(1024px以下・共有1枚)。
-function createCamoTexture(scene: Scene): DynamicTexture {
-  const size = 512;
-  const tex = new DynamicTexture(
-    "camoTex",
-    { width: size, height: size },
-    scene,
-    false,
-  );
-  const ctx = tex.getContext() as unknown as CanvasRenderingContext2D;
-  // 地色: くすんだカーキ。
-  ctx.fillStyle = "#5c6038";
-  ctx.fillRect(0, 0, size, size);
-  // まだら斑(緑・茶・カーキ・暗色)を角ばった多角形で重ねてシャープな迷彩に。
-  const blobColors = ["#6f7347", "#464a29", "#3a3c22", "#7c7a52", "#54502e"];
-  for (let i = 0; i < 340; i++) {
-    ctx.fillStyle = blobColors[i % blobColors.length];
-    const cx = Math.random() * size;
-    const cy = Math.random() * size;
-    const r = 10 + Math.random() * 40;
-    const verts = 5 + Math.floor(Math.random() * 4); // 5〜8角形の不定形。
-    ctx.beginPath();
-    for (let v = 0; v < verts; v++) {
-      const ang = (v / verts) * Math.PI * 2 + Math.random() * 0.5;
-      const rr = r * (0.55 + Math.random() * 0.7);
-      const px = cx + Math.cos(ang) * rr;
-      const py = cy + Math.sin(ang) * rr;
-      if (v === 0) ctx.moveTo(px, py);
-      else ctx.lineTo(px, py);
-    }
-    ctx.closePath();
-    ctx.fill();
-  }
-  tex.update();
-  return tex;
+// clone した1体分のハンドル(可視メッシュ + 照準で色を変えるマテリアル群 + ピックコライダー)。
+interface SoldierInstance {
+  root: TransformNode; // 位置/スケール/回転tweenの対象(実モデルは複数メッシュの親、フォールバックはMesh自体)。
+  hiliteMats: Array<StandardMaterial | PBRMaterial>; // emissiveを書き換える部位マテリアル。
+  collider: Mesh | null; // 不可視のピック用ボックス(選択肢の敵のみ)。
+  idle: AnimationGroup | null; // この個体専用のループ立ち姿アニメーション(無ければ null)。
+}
+
+// 読み込んだモデルのテンプレート(instantiateModelsToScene元)一式。
+interface ModelTemplates {
+  // 兵士のAssetContainer。instantiateModelsToScene() で個体ごとに独立したスキン付き
+  // インスタンスを生成する(スキンメッシュはMergeMeshesで結合すると変形が破綻するため、
+  // Babylon公式の複製手段であるAssetContainerを使う)。読み込み失敗時は null。
+  soldierContainer: AssetContainer | null;
+  soldierScale: number; // TARGET_HEIGHT に合わせる一様スケール。
+  soldierFootOffset: number; // 足が y=0 に来るようにする位置オフセット。
+  rifle: Mesh | null; // 銃ビューモデル(読み込み失敗時は null → 簡易生成にフォールバック)。
 }
 
 // 地面テクスチャ(土・草地)を手続き生成する。256x256、タイリング前提のノイズ。
@@ -254,136 +271,93 @@ function paintMesh(mesh: Mesh, r: number, g: number, b: number): void {
   mesh.setVerticesData(VertexBuffer.ColorKind, colors);
 }
 
-// 敵AI兵士に割り当てるマテリアル一式(部位ごとに色/質感を変え、頭部と胴体の
-// コントラストを明確にする)。多重マテリアルMergeで1メッシュ内の別サブメッシュになる。
-interface SoldierMats {
-  camo: StandardMaterial; // 胴体・脚・腕(迷彩テクスチャ)
-  skin: StandardMaterial; // 顔(くすんだタン色。迷彩と明確に差をつける)
-  helmet: StandardMaterial; // ヘルメット(濃色。頭部との境目を強調)
-  gun: StandardMaterial; // 手持ちライフル(ガンメタル)
+
+// glTFの読み込み結果から、可視ジオメトリを持つメッシュだけを取り出す(__root__等は除外)。
+function collectGeometryMeshes(meshes: Mesh[]): Mesh[] {
+  return meshes.filter(
+    (m): m is Mesh => m instanceof Mesh && m.getTotalVertices() > 0,
+  );
 }
 
-// 人型(敵AI兵士)メッシュを手続き生成する。脚2本+胴体+頭部(肌色)+ヘルメット(濃色)+
-// 腕2本+手持ちライフルを、部位別マテリアルを付けたまま多重マテリアルMergeで1メッシュ化する。
-// 兵士は -z 側(カメラのいる方向)を正面とし、腕と銃を前面に構える。人体比率を意識し全高約1.8。
-// 1体あたり約200ポリゴン(緩和後予算に対し十分低い)。
-function buildSoldier(scene: Scene, mats: SoldierMats): Mesh {
-  const parts: Mesh[] = [];
-  const add = (m: Mesh, mat: StandardMaterial) => {
-    m.material = mat;
-    parts.push(m);
-  };
+// PBRMaterial 1枚を StandardMaterial へ変換する。
+// このシーンには scene.environmentTexture(IBL)を設定していないため、PBRMaterialは
+// 間接照明の寄与がほぼゼロになり、特にmetallicが高いマテリアルは真っ黒に見える
+// (Babylon.jsでよくある落とし穴)。IBL無しでも安定して発色するStandardMaterialへ
+// 変換することで、既存のHemisphericLight+DirectionalLightだけで正しく陰影がつくようにする。
+function pbrToStandard(scene: Scene, mat: PBRMaterial): StandardMaterial {
+  const std = new StandardMaterial(`${mat.name}-std`, scene);
+  const c = mat.albedoColor ? mat.albedoColor.clone() : new Color3(0.5, 0.5, 0.5);
+  // 一部の戦術装備色はbaseColorFactorが極端に暗く(黒い服等)、IBL無しのStandard
+  // Materialでは画面上でほぼシルエットになってしまう。視認性のため、暗すぎる色は
+  // 色相を保ったまま最低輝度まで底上げする(真っ黒に近いVisor等も少し持ち上がるが、
+  // 完全な黒つぶれを避ける方を優先する)。
+  const MIN_BRIGHTNESS = 0.16;
+  const brightness = (c.r + c.g + c.b) / 3;
+  if (brightness > 0 && brightness < MIN_BRIGHTNESS) {
+    c.scaleInPlace(Math.min(MIN_BRIGHTNESS / brightness, 5));
+  } else if (brightness === 0) {
+    c.set(MIN_BRIGHTNESS, MIN_BRIGHTNESS, MIN_BRIGHTNESS);
+  }
+  std.diffuseColor = c;
+  if (mat.albedoTexture instanceof Texture) std.diffuseTexture = mat.albedoTexture;
+  std.emissiveColor = mat.emissiveColor ? mat.emissiveColor.clone() : new Color3(0, 0, 0);
+  std.alpha = mat.alpha;
+  // metallic-roughnessの厳密な変換はせず、控えめな鏡面反射で近似する。
+  std.specularColor = new Color3(0.08, 0.08, 0.08);
+  std.specularPower = 32;
+  return std;
+}
 
-  // 脚: 2本の円柱(8角)。接地(y=0)から腰まで。人型の下半身を明示する。
+// メッシュのマテリアル(単一 or MultiMaterial)に含まれるPBRMaterialをすべてStandardMaterialへ
+// 変換する。PBRでないマテリアルはそのまま維持する。
+function convertPbrMaterialsToStandard(scene: Scene, mesh: Mesh): void {
+  const mat = mesh.material;
+  if (mat instanceof MultiMaterial) {
+    mat.subMaterials = mat.subMaterials.map((m) =>
+      m instanceof PBRMaterial ? pbrToStandard(scene, m) : m,
+    );
+  } else if (mat instanceof PBRMaterial) {
+    mesh.material = pbrToStandard(scene, mat);
+  }
+}
+
+// 読み込み失敗時のフォールバック兵士(単一マテリアルの簡易人型)。約1.7全高・足接地・-z正面。
+function buildFallbackSoldier(scene: Scene): Mesh {
+  const parts: Mesh[] = [];
   for (const sx of [-0.14, 0.14]) {
     const leg = MeshBuilder.CreateCylinder(
-      "soldierLeg",
+      "fbLeg",
       { height: 0.86, diameterTop: 0.2, diameterBottom: 0.17, tessellation: 8 },
       scene,
     );
     leg.position.set(sx, 0.43, 0);
-    add(leg, mats.camo);
+    parts.push(leg);
   }
-
-  // 胴体: 肩に向けて広がる8角柱(下=腰、上=肩)。迷彩(防弾ベスト相当)。
   const torso = MeshBuilder.CreateCylinder(
-    "soldierTorso",
+    "fbTorso",
     { height: 0.66, diameterTop: 0.52, diameterBottom: 0.42, tessellation: 8 },
     scene,
   );
   torso.position.y = 1.19;
-  add(torso, mats.camo);
-
-  // 首: 短い肌色円柱で頭と胴をつなぎ、頭部の独立感を出す。
-  const neck = MeshBuilder.CreateCylinder(
-    "soldierNeck",
-    { height: 0.1, diameter: 0.16, tessellation: 6 },
-    scene,
-  );
-  neck.position.y = 1.56;
-  add(neck, mats.skin);
-
-  // 頭部(顔): 肌色〜タン色の球体。箱だとブロック状(マイクラ風)に見えるため丸みを持たせる。
+  parts.push(torso);
   const head = MeshBuilder.CreateSphere(
-    "soldierHead",
+    "fbHead",
     { diameter: 0.27, segments: 8 },
     scene,
   );
-  head.position.y = 1.72;
-  add(head, mats.skin);
-
-  // ヘルメット: 頭を覆う一回り大きい球(下半分は頭に隠れ、ドーム状に見える)。濃色。
+  head.position.y = 1.6;
+  parts.push(head);
   const helmet = MeshBuilder.CreateSphere(
-    "soldierHelmet",
-    { diameter: 0.36, segments: 8, slice: 0.62 },
+    "fbHelmet",
+    { diameter: 0.34, segments: 8, slice: 0.62 },
     scene,
   );
-  helmet.position.y = 1.85;
-  add(helmet, mats.helmet);
-
-  // 右腕: 肩から前方(-z)へ。円柱(先細り)で丸みを持たせ、銃のグリップを握る形。
-  const rightArm = MeshBuilder.CreateCylinder(
-    "soldierArmR",
-    { height: 0.5, diameterTop: 0.11, diameterBottom: 0.14, tessellation: 8 },
-    scene,
-  );
-  rightArm.position.set(0.28, 1.16, -0.13);
-  rightArm.rotation.x = 0.5;
-  add(rightArm, mats.camo);
-
-  // 左腕: 反対側からフォアグリップへ深く前方に伸ばす円柱。
-  const leftArm = MeshBuilder.CreateCylinder(
-    "soldierArmL",
-    { height: 0.48, diameterTop: 0.11, diameterBottom: 0.14, tessellation: 8 },
-    scene,
-  );
-  leftArm.position.set(-0.15, 1.1, -0.3);
-  leftArm.rotation.x = 0.9;
-  add(leftArm, mats.camo);
-
-  // ライフル レシーバー: 胴体前面に水平に構える。ガンメタル。
-  const rifle = MeshBuilder.CreateBox(
-    "soldierRifle",
-    { width: 0.09, height: 0.11, depth: 0.6 },
-    scene,
-  );
-  rifle.position.set(0.02, 1.19, -0.34);
-  add(rifle, mats.gun);
-
-  // ライフル マガジン: レシーバー下の箱。
-  const rifleMag = MeshBuilder.CreateBox(
-    "soldierRifleMag",
-    { width: 0.06, height: 0.18, depth: 0.09 },
-    scene,
-  );
-  rifleMag.position.set(0.02, 1.03, -0.28);
-  add(rifleMag, mats.gun);
-
-  // ライフル 銃身: 前方へ細い円柱。
-  const rifleBarrel = MeshBuilder.CreateCylinder(
-    "soldierRifleBarrel",
-    { height: 0.3, diameter: 0.04, tessellation: 6 },
-    scene,
-  );
-  rifleBarrel.rotation.x = Math.PI / 2;
-  rifleBarrel.position.set(0.02, 1.19, -0.72);
-  add(rifleBarrel, mats.gun);
-
-  // 部位ごとのマテリアルを保持したまま多重マテリアルでMerge(1メッシュ・サブメッシュ複数)。
-  const merged = Mesh.MergeMeshes(
-    parts,
-    true, // ソースメッシュを破棄
-    true, // 32bitインデックス許可
-    undefined,
-    false,
-    true, // multiMultiMaterials: サブメッシュ+MultiMaterialとしてまとめる
-  );
-  if (!merged) {
-    // Merge失敗時のフォールバック(通常起きない)。胴体だけでも返す。
-    return torso;
-  }
-  merged.name = "soldierTemplate";
-  return merged;
+  helmet.position.y = 1.72;
+  parts.push(helmet);
+  const merged = Mesh.MergeMeshes(parts, true, true);
+  const soldier = merged ?? torso;
+  soldier.name = "fallbackSoldier";
+  return soldier;
 }
 
 export default function LockOnScene({ questions, onComplete }: LockOnSceneProps) {
@@ -413,8 +387,9 @@ export default function LockOnScene({ questions, onComplete }: LockOnSceneProps)
     null,
   );
   const [labels, setLabels] = useState<EnemyLabel[]>([]);
-  // 初回起動時ベンチマーク中はローディングUIを表示する(キャッシュがあれば即座に false)。
-  const [benchmarking, setBenchmarking] = useState(true);
+  // 初回起動時ベンチマーク・モデル読み込み中はローディングUIを表示する。
+  const [loading, setLoading] = useState(true);
+  const [loadingLabel, setLoadingLabel] = useState("描画品質を計測中...");
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -422,20 +397,117 @@ export default function LockOnScene({ questions, onComplete }: LockOnSceneProps)
 
     const qs = questionsRef.current;
     if (qs.length === 0) {
-      setBenchmarking(false);
+      setLoading(false);
       onCompleteRef.current([]);
       return;
     }
 
-    // 非同期(ベンチマーク→本番シーン構築)。アンマウント時の破棄を disposed で管理する。
+    // 非同期(ベンチマーク→モデル読込→本番シーン構築)。アンマウント時の破棄を disposed で管理する。
     let disposed = false;
     let engineForCleanup: Engine | null = null;
     let sceneForCleanup: Scene | null = null;
     let handleResize: (() => void) | null = null;
     let detachInput: (() => void) | null = null;
 
+    // ---- モデルテンプレートの読み込み(初回1度) ----
+    // SWATと銃をglTF読み込みし、兵士は多重マテリアルMergeで1メッシュ(4サブメッシュ)へ畳む。
+    // 失敗しても throw せず、簡易フォールバックのテンプレートを返す(画面が真っ白にならないよう)。
+    const loadModelTemplates = async (scene: Scene): Promise<ModelTemplates> => {
+      // --- 兵士 ---
+      // SWATは4つの独立したスキンメッシュ(Legs/Feet/Body/Head、各々が62ボーンの
+      // スケルトンを参照)で構成されている。MergeMeshesで1メッシュに結合すると、
+      // メッシュノード自身のtransform(スケール100倍等)がスキニング前提の座標系と
+      // 二重に適用され、頂点の変形が破綻する(手足が異常に伸びる等の不具合の原因)。
+      // このため結合はせず、Babylon公式の複製手段である
+      // AssetContainer.instantiateModelsToScene() で個体ごとに独立したスキン付き
+      // インスタンスを生成する(スケルトン・アニメーションも複製時に正しく複製される)。
+      let soldierContainer: AssetContainer | null = null;
+      let soldierScale = 1;
+      let soldierFootOffset = 0;
+      try {
+        const container = await SceneLoader.LoadAssetContainerAsync(
+          "/models/",
+          "swat-soldier.glb",
+          scene,
+        );
+        // glTFのPBRMaterialはIBL(環境テクスチャ)無しだと真っ黒に見えるため、StandardMaterialへ変換する。
+        for (const m of container.meshes) {
+          if (m instanceof Mesh) convertPbrMaterialsToStandard(scene, m);
+        }
+        // 高さ計測用に一度だけ一時インスタンス化し、寸法を測ったら破棄する
+        // (container自体はシーンに追加されないため、テンプレートとして安全に保持できる)。
+        const probe = container.instantiateModelsToScene(
+          (n) => `probe-${n}`,
+          false,
+        );
+        let minY = Infinity;
+        let maxY = -Infinity;
+        for (const root of probe.rootNodes) {
+          for (const m of root.getChildMeshes(false)) {
+            m.computeWorldMatrix(true);
+            m.refreshBoundingInfo(true, false);
+            const bb = m.getBoundingInfo().boundingBox;
+            minY = Math.min(minY, bb.minimumWorld.y);
+            maxY = Math.max(maxY, bb.maximumWorld.y);
+          }
+        }
+        const height = maxY > minY ? maxY - minY : 1;
+        soldierScale = TARGET_HEIGHT / height;
+        soldierFootOffset = -minY * soldierScale;
+        for (const ag of probe.animationGroups) ag.dispose();
+        for (const sk of probe.skeletons) sk.dispose();
+        for (const root of probe.rootNodes) root.dispose();
+        soldierContainer = container;
+      } catch (err) {
+        console.error(
+          "[LockOnScene] SWATモデルの読み込みに失敗。簡易兵士へフォールバックします。",
+          err,
+        );
+        soldierContainer = null;
+        soldierScale = 1;
+        soldierFootOffset = 0;
+      }
+
+      // --- 銃(ライフル) ---
+      let rifle: Mesh | null = null;
+      try {
+        const result = await SceneLoader.ImportMeshAsync(
+          "",
+          "/models/",
+          "assault-rifle.glb",
+          scene,
+        );
+        for (const ag of result.animationGroups) ag.dispose();
+        const geo = collectGeometryMeshes(result.meshes as Mesh[]);
+        if (geo.length === 0) throw new Error("Rifle: ジオメトリメッシュが見つからない");
+        // 単一マテリアルへ畳む(3サブメッシュ→1ドローコール)。銃口色は近似的に単色で締める。
+        const merged =
+          geo.length === 1 && geo[0].subMeshes && geo[0].subMeshes.length <= 1
+            ? geo[0]
+            : Mesh.MergeMeshes(geo, true, true);
+        rifle = merged ?? geo[0] ?? null;
+        if (rifle) {
+          rifle.name = "rifleTemplate";
+          convertPbrMaterialsToStandard(scene, rifle);
+        }
+      } catch (err) {
+        console.error(
+          "[LockOnScene] ライフルモデルの読み込みに失敗。簡易銃へフォールバックします。",
+          err,
+        );
+        rifle = null; // buildScene 側で簡易銃を生成する。
+      }
+
+      return {
+        soldierContainer,
+        soldierScale,
+        soldierFootOffset,
+        rifle,
+      };
+    };
+
     // 本番シーンを構築する。hardwareScalingLevel はベンチマーク結果を反映する。
-    const buildScene = (hardwareScalingLevel: number) => {
+    const buildScene = async (hardwareScalingLevel: number) => {
       const engine = new Engine(canvas, true, {
         preserveDrawingBuffer: true,
         stencil: true,
@@ -454,26 +526,24 @@ export default function LockOnScene({ questions, onComplete }: LockOnSceneProps)
       scene.fogEnd = 46;
 
       // 環境光(1灯目)。屋外の明るい色温度に調整(空=淡い暖色、地面反射=くすんだ緑)。
-      // 方向光を追加したぶん環境光はやや控えめにして陰影を残す。
       const light = new HemisphericLight("light", new Vector3(0, 1, 0.2), scene);
-      light.intensity = 0.85;
+      light.intensity = 0.9;
       light.diffuse = new Color3(1, 0.97, 0.88);
       light.groundColor = new Color3(0.42, 0.45, 0.38);
 
       // 方向光(2灯目)。暖色の太陽光を斜め上手前から当て、モデルに立体感(陰影)を出す。
-      // ライトは環境光+2灯まで許容の範囲内(本シーンは合計2灯)。
       const sun = new DirectionalLight(
         "sun",
         new Vector3(-0.55, -1, 0.35),
         scene,
       );
       sun.position = new Vector3(12, 20, -12);
-      sun.intensity = 1.25;
+      sun.intensity = 1.35;
       sun.diffuse = new Color3(1, 0.93, 0.78);
       sun.specular = new Color3(0.2, 0.2, 0.18);
 
-      // 低解像度シャドウ(512px, blur exponential)。1灯分・受影は地面のみに限定して
-      // パフォーマンス影響を最小化する(方針で許容された簡易シャドウ)。
+      // 低解像度シャドウ(512px, blur exponential)。1灯分・受影は地面のみ・投影は選択肢の敵のみに
+      // 限定してドローコール/負荷を抑える(方針で許容された簡易シャドウ)。
       const shadowGen = new ShadowGenerator(512, sun);
       shadowGen.useBlurExponentialShadowMap = true;
       shadowGen.blurKernel = 16;
@@ -482,10 +552,14 @@ export default function LockOnScene({ questions, onComplete }: LockOnSceneProps)
       sun.shadowMinZ = 1;
       sun.shadowMaxZ = 40;
 
-      // 全兵士・地面・建物で共有するプロシージャルテクスチャ(1024px以下・計3枚)。
-      const camoTex = createCamoTexture(scene);
+      // 地面・建物で共有するプロシージャルテクスチャ(1024px以下・計2枚)。
       const groundTex = createGroundTexture(scene);
       const bldgTex = createBuildingTexture(scene);
+
+      // ---- モデル読み込み(ローディング表示を切り替えてから待つ) ----
+      if (!disposed) setLoadingLabel("モデルを読み込み中...");
+      const templates = await loadModelTemplates(scene);
+      if (disposed) return;
 
       // レール移動カメラ。位置はレールで固定し、視点回転のみプレイヤー操作可。
       const camera = new FreeCamera(
@@ -527,6 +601,7 @@ export default function LockOnScene({ questions, onComplete }: LockOnSceneProps)
       // 地面のみをシャドウの受影対象にする(受影1メッシュに限定して負荷を抑える)。
       // receiveShadows のシェーダ定義を確実に含めるため groundMat は freeze しない。
       ground.receiveShadows = true;
+      ground.isPickable = false;
 
       // 遠景の建物群。ビル本体(窓テクスチャ+頂点カラーで色味に変化)と切妻風の屋根を
       // それぞれ1メッシュにMergeし、背景を計2ドローコールに抑える。フォグで空へ溶ける。
@@ -597,183 +672,198 @@ export default function LockOnScene({ questions, onComplete }: LockOnSceneProps)
         roofs.material = roofMat;
       }
 
-      // 敵の各部位色。迷彩は明るめ白寄りの下地にテクスチャを乗算。顔=タン、ヘルメット=濃色。
-      // 命中可能を示すハイライトは迷彩/顔/ヘルメットの emissive を一括で切り替えて表現する。
-      const ENEMY_DIFFUSE = new Color3(0.95, 0.95, 0.9);
-      const ENEMY_SKIN = new Color3(0.74, 0.58, 0.44); // くすんだタン色の顔。
-      const ENEMY_HELMET = new Color3(0.16, 0.19, 0.13); // 濃いオリーブのヘルメット。
-      const ENEMY_EMISSIVE_BASE = new Color3(0.02, 0.03, 0.02);
-      const ENEMY_EMISSIVE_AIM = new Color3(0.1, 0.5, 0.55); // 照準が乗った時のシアン寄り発光。
-
-      // 迷彩を共有しつつ照準ハイライトは個別に切り替えられるよう、部位別マテリアルを生成する
-      // 小ヘルパ。迷彩テクスチャは全マテリアルで共有(テクスチャ枚数・ドローコールは増やさない)。
-      const makeSoldierMats = (
-        tag: string,
-        tint: number,
-        emissive: Color3,
-      ): SoldierMats => {
-        const camo = new StandardMaterial(`camoMat-${tag}`, scene);
-        camo.diffuseColor = ENEMY_DIFFUSE.scale(tint);
-        camo.diffuseTexture = camoTex;
-        camo.emissiveColor = emissive.clone();
-        camo.specularColor = new Color3(0, 0, 0);
-        const skin = new StandardMaterial(`skinMat-${tag}`, scene);
-        skin.diffuseColor = ENEMY_SKIN.scale(tint);
-        skin.emissiveColor = emissive.clone();
-        skin.specularColor = new Color3(0.05, 0.05, 0.05);
-        const helmet = new StandardMaterial(`helmetMat-${tag}`, scene);
-        helmet.diffuseColor = ENEMY_HELMET.scale(tint);
-        helmet.emissiveColor = emissive.clone();
-        helmet.specularColor = new Color3(0.08, 0.08, 0.08);
-        const gun = new StandardMaterial(`enemyGunMat-${tag}`, scene);
-        gun.diffuseColor = new Color3(0.13, 0.14, 0.15);
-        gun.emissiveColor = new Color3(0.01, 0.01, 0.012);
-        gun.specularColor = new Color3(0.1, 0.1, 0.12);
-        return { camo, skin, helmet, gun };
+      // AbstractMesh を1つでも含むノード配下のメッシュ全部にコールバックを適用する
+      // (ShadowGenerator へのcaster登録・ピック不可設定などに使う共通ヘルパ)。
+      const forEachMeshOf = (node: TransformNode, cb: (m: AbstractMesh) => void) => {
+        if (node instanceof AbstractMesh) cb(node);
+        for (const m of node.getChildMeshes(false)) cb(m);
       };
 
-      // 選択肢の敵AI兵士(pool)。人型メッシュを個別に生成し、各自にマテリアル群とメタデータを持たせる。
-      // (thin instancesベースとジオメトリを共有しないよう clone は使わず個別生成する。)
-      const enemyMeshes: Mesh[] = [];
-      // 照準ハイライトで emissive を書き換える部位マテリアル群(迷彩/顔/ヘルメット)。
-      const enemyHiliteMats: StandardMaterial[][] = [];
+      // ---- 兵士テンプレートから clone してプールを作るヘルパ ----
+      // 実モデルは AssetContainer.instantiateModelsToScene() で個体ごとに独立した
+      // スキン付きインスタンス(メッシュ・スケルトン・アニメーション一式)を生成する。
+      // 読み込み失敗時は手続き生成のフォールバック兵士(単一メッシュ)を使う。
+      const cloneSoldier = (
+        name: string,
+        opts: { pickable: boolean; darken: number },
+      ): SoldierInstance => {
+        let root: TransformNode;
+        const hiliteMats: Array<StandardMaterial | PBRMaterial> = [];
+        let idle: AnimationGroup | null = null;
+
+        if (templates.soldierContainer) {
+          const inst = templates.soldierContainer.instantiateModelsToScene(
+            (n) => `${name}-${n}`,
+            true, // マテリアルも複製(照準ハイライト/暗色化を個体ごとに独立させるため)。
+          );
+          const parent = new TransformNode(`${name}-root`, scene);
+          for (const r of inst.rootNodes) r.parent = parent;
+          root = parent;
+
+          forEachMeshOf(parent, (m) => {
+            m.isPickable = false; // 可視メッシュは常に非ピック(ピックはコライダーで行う)。
+            const mat = m.material;
+            if (mat instanceof StandardMaterial || mat instanceof PBRMaterial) {
+              if (opts.darken < 1) {
+                if (mat instanceof PBRMaterial) {
+                  mat.albedoColor.scaleInPlace(opts.darken);
+                } else {
+                  mat.diffuseColor.scaleInPlace(opts.darken);
+                }
+              }
+              mat.emissiveColor = ENEMY_EMISSIVE_BASE.clone();
+              if (!opts.pickable) mat.freeze(); // おとり(非ハイライト)は freeze してよい。
+              hiliteMats.push(mat);
+            }
+          });
+
+          idle =
+            inst.animationGroups.find((a) => /Idle_Gun\b/.test(a.name)) ??
+            inst.animationGroups.find((a) => /\bIdle\b/i.test(a.name)) ??
+            inst.animationGroups.find((a) => /Idle/i.test(a.name)) ??
+            null;
+          for (const ag of inst.animationGroups) {
+            if (ag === idle) ag.start(true, 1.0);
+            else ag.dispose();
+          }
+        } else {
+          // フォールバック兵士(単一メッシュ、スケルトン/アニメ無し)。
+          const fb = buildFallbackSoldier(scene);
+          const m = new StandardMaterial(`${name}-fbmat`, scene);
+          m.diffuseColor = new Color3(0.32, 0.35, 0.24).scale(
+            opts.darken < 1 ? opts.darken : 1,
+          );
+          m.specularColor = new Color3(0.02, 0.02, 0.02);
+          m.emissiveColor = ENEMY_EMISSIVE_BASE.clone();
+          if (!opts.pickable) m.freeze();
+          fb.material = m;
+          fb.isPickable = false;
+          root = fb;
+          hiliteMats.push(m);
+        }
+
+        root.scaling.setAll(templates.soldierScale);
+        root.rotation.set(0, SOLDIER_FACING_Y, 0);
+
+        // ピック用コライダー(不可視)。選択肢の敵のみに付与する。
+        let collider: Mesh | null = null;
+        if (opts.pickable) {
+          collider = MeshBuilder.CreateBox(`${name}-col`, COLLIDER_SIZE, scene);
+          collider.isVisible = false;
+          collider.isPickable = true;
+          collider.setEnabled(true);
+        }
+
+        return { root, hiliteMats, collider, idle };
+      };
+
+      // 選択肢の敵AI兵士(pool)。個別コライダー付き。
+      const enemies: SoldierInstance[] = [];
       for (let i = 0; i < MAX_ENEMIES; i++) {
-        const mats = makeSoldierMats(`enemy-${i}`, 1, ENEMY_EMISSIVE_BASE);
-        const enemy = buildSoldier(scene, mats);
-        enemy.name = `enemy-${i}`;
-        enemy.metadata = { isEnemy: true, choiceId: null as string | null };
-        shadowGen.addShadowCaster(enemy); // 敵は影を落とす(受影は地面のみ)。
-        enemyMeshes.push(enemy);
-        enemyHiliteMats.push([mats.camo, mats.skin, mats.helmet]);
+        const inst = cloneSoldier(`enemy-${i}`, { pickable: true, darken: 1 });
+        if (inst.collider) {
+          inst.collider.metadata = {
+            isEnemy: true,
+            enemyIndex: i,
+            choiceId: null as string | null,
+          };
+        }
+        // 選択肢の敵のみ影を落とす(受影は地面)。
+        forEachMeshOf(inst.root, (m) => shadowGen.addShadowCaster(m, false));
+        enemies.push(inst);
       }
 
-      // おとりの敵: 独立した人型メッシュをベースにし、thin instances で3体を描画する。
-      // 選択肢を持たず、撃ってもミス扱い(ピック対象にしない)。部位別マテリアルはやや暗く固定。
-      const decoyMats = makeSoldierMats("decoy", 0.62, new Color3(0.02, 0.02, 0.02));
-      decoyMats.camo.freeze();
-      decoyMats.skin.freeze();
-      decoyMats.helmet.freeze();
-      decoyMats.gun.freeze();
-      const decoyBase = buildSoldier(scene, decoyMats);
-      decoyBase.name = "decoyBase";
-      decoyBase.isPickable = false;
-      shadowGen.addShadowCaster(decoyBase); // おとりも影を落とす(thin instances対応)。
-      const decoyMatrices = new Float32Array(DRONE_SPECS.length * 16);
+      // おとりの敵(妨害ドローン相当)。3体を個別cloneし、やや暗くして固定(ピック対象外)。
+      const decoys: SoldierInstance[] = [];
       for (let i = 0; i < DRONE_SPECS.length; i++) {
-        Matrix.Identity().copyToArray(decoyMatrices, i * 16);
+        const inst = cloneSoldier(`decoy-${i}`, { pickable: false, darken: 0.62 });
+        decoys.push(inst);
       }
-      decoyBase.thinInstanceSetBuffer("matrix", decoyMatrices, 16);
 
-      // 銃ビューモデル(カメラ追従)。ストック/レシーバー/ピストルグリップ/トリガーガード/
-      // マガジン(前傾)/ハンドガード/フォアグリップ/銃身/サイトを箱・円柱で組み、Mergeで
-      // 1メッシュに。ライフルを構えたシルエットが分かる形にしつつ、視界を遮らないよう
-      // 前回より一回り小さくして右下に程よく収める。ローカル+z=前方(銃口方向)。ピック対象外。
-      const gunParts: Mesh[] = [];
-      // レシーバー(本体)。
-      const gunReceiver = MeshBuilder.CreateBox(
-        "gunReceiver",
-        { width: 0.13, height: 0.15, depth: 0.62 },
-        scene,
-      );
-      gunReceiver.position.set(0, 0, 0.05);
-      gunParts.push(gunReceiver);
-      // ストック: レシーバー後方(手前)へ、肩付け方向にやや下げて。
-      const gunStock = MeshBuilder.CreateBox(
-        "gunStock",
-        { width: 0.1, height: 0.14, depth: 0.3 },
-        scene,
-      );
-      gunStock.position.set(0, -0.06, -0.42);
-      gunStock.rotation.x = -0.08;
-      gunParts.push(gunStock);
-      // ピストルグリップ: レシーバー下後方へ斜めに下ろす。
-      const gunGrip = MeshBuilder.CreateBox(
-        "gunGrip",
-        { width: 0.08, height: 0.22, depth: 0.1 },
-        scene,
-      );
-      gunGrip.position.set(0, -0.16, -0.16);
-      gunGrip.rotation.x = -0.5;
-      gunParts.push(gunGrip);
-      // トリガーガード: グリップ前方の小さな薄い箱(輪の代用)。
-      const gunTrigger = MeshBuilder.CreateBox(
-        "gunTrigger",
-        { width: 0.05, height: 0.08, depth: 0.12 },
-        scene,
-      );
-      gunTrigger.position.set(0, -0.11, -0.05);
-      gunParts.push(gunTrigger);
-      // マガジン: レシーバー下に前傾(下向きに斜め)で差し込む。
-      const gunMag = MeshBuilder.CreateBox(
-        "gunMag",
-        { width: 0.07, height: 0.26, depth: 0.14 },
-        scene,
-      );
-      gunMag.position.set(0, -0.2, 0.04);
-      gunMag.rotation.x = 0.3;
-      gunParts.push(gunMag);
-      // ハンドガード: レシーバー前方の細い箱。
-      const gunHandguard = MeshBuilder.CreateBox(
-        "gunHandguard",
-        { width: 0.09, height: 0.09, depth: 0.36 },
-        scene,
-      );
-      gunHandguard.position.set(0, -0.005, 0.5);
-      gunParts.push(gunHandguard);
-      // フォアグリップ: ハンドガード下に垂直の短い持ち手。
-      const gunForegrip = MeshBuilder.CreateBox(
-        "gunForegrip",
-        { width: 0.05, height: 0.14, depth: 0.06 },
-        scene,
-      );
-      gunForegrip.position.set(0, -0.11, 0.46);
-      gunParts.push(gunForegrip);
-      // 銃身: ハンドガード先端から前方へ。
-      const gunBarrel = MeshBuilder.CreateCylinder(
-        "gunBarrel",
-        { height: 0.44, diameter: 0.05, tessellation: 6 },
-        scene,
-      );
-      gunBarrel.rotation.x = Math.PI / 2; // 前方(z+)へ向ける。
-      gunBarrel.position.set(0, 0.005, 0.82);
-      gunParts.push(gunBarrel);
-      // リアサイト: レシーバー後方上面の小さな箱。
-      const gunRearSight = MeshBuilder.CreateBox(
-        "gunRearSight",
-        { width: 0.05, height: 0.07, depth: 0.05 },
-        scene,
-      );
-      gunRearSight.position.set(0, 0.11, -0.12);
-      gunParts.push(gunRearSight);
-      // フロントサイト: 銃身付け根上面の細い箱。
-      const gunFrontSight = MeshBuilder.CreateBox(
-        "gunFrontSight",
-        { width: 0.03, height: 0.09, depth: 0.03 },
-        scene,
-      );
-      gunFrontSight.position.set(0, 0.11, 0.56);
-      gunParts.push(gunFrontSight);
-      const gun = Mesh.MergeMeshes(gunParts, true, true);
-      // ダークガンメタル調(迷彩は乗せず単色でシルエットを締める)。方向光でハイライトが出る。
+      // ---- 銃ビューモデル(カメラ追従) ----
+      // 読み込んだライフルを右下に配置する。読み込み失敗時は簡易な箱で銃を組む。
       const gunMat = new StandardMaterial("gunMat", scene);
       gunMat.diffuseColor = new Color3(0.15, 0.16, 0.18);
       gunMat.specularColor = new Color3(0.35, 0.36, 0.4); // 金属的なハイライト。
       gunMat.specularPower = 48;
       gunMat.emissiveColor = new Color3(0.015, 0.015, 0.02);
       gunMat.freeze();
-      let muzzle: Mesh | null = null;
-      if (gun) {
+
+      let gun: Mesh | null = null;
+      if (templates.rifle) {
+        gun = templates.rifle;
         gun.name = "gunView";
         gun.material = gunMat;
         gun.isPickable = false;
+        gun.setEnabled(true);
         gun.parent = camera;
-        shadowGen.addShadowCaster(gun); // 銃も地面に簡易な影を落とす。
-        // 画面右下寄り。前回よりやや小さく・下げて視界の邪魔を減らす。
-        gun.position.set(0.3, -0.34, 0.78);
-        gun.rotation.set(0.04, -0.05, 0);
-        gun.scaling.setAll(0.9);
+        // ライフルを TARGET とは別に一定長へ合わせる。銃身が +z(前方)を向くよう回転を調整する。
+        gun.computeWorldMatrix(true);
+        gun.refreshBoundingInfo(true);
+        const rb = gun.getBoundingInfo().boundingBox;
+        const dims = rb.maximumWorld.subtract(rb.minimumWorld);
+        const longest = Math.max(dims.x, dims.y, dims.z, 0.001);
+        const rifleScale = 0.85 / longest; // 画面内で程よい銃の長さに。
+        gun.scaling.setAll(rifleScale);
+        // 右下に構える。銃口方向はモデル依存のため回転を与えて調整する。
+        gun.position.set(0.32, -0.36, 0.7);
+        gun.rotation.set(0.02, Math.PI, 0);
+      } else {
+        // フォールバック: 簡易な箱組みのライフル。
+        const gunParts: Mesh[] = [];
+        const receiver = MeshBuilder.CreateBox(
+          "gunReceiver",
+          { width: 0.13, height: 0.15, depth: 0.62 },
+          scene,
+        );
+        receiver.position.set(0, 0, 0.05);
+        gunParts.push(receiver);
+        const stock = MeshBuilder.CreateBox(
+          "gunStock",
+          { width: 0.1, height: 0.14, depth: 0.3 },
+          scene,
+        );
+        stock.position.set(0, -0.06, -0.42);
+        gunParts.push(stock);
+        const grip = MeshBuilder.CreateBox(
+          "gunGrip",
+          { width: 0.08, height: 0.22, depth: 0.1 },
+          scene,
+        );
+        grip.position.set(0, -0.16, -0.16);
+        grip.rotation.x = -0.5;
+        gunParts.push(grip);
+        const mag = MeshBuilder.CreateBox(
+          "gunMag",
+          { width: 0.07, height: 0.26, depth: 0.14 },
+          scene,
+        );
+        mag.position.set(0, -0.2, 0.04);
+        mag.rotation.x = 0.3;
+        gunParts.push(mag);
+        const barrel = MeshBuilder.CreateCylinder(
+          "gunBarrel",
+          { height: 0.44, diameter: 0.05, tessellation: 6 },
+          scene,
+        );
+        barrel.rotation.x = Math.PI / 2;
+        barrel.position.set(0, 0.005, 0.82);
+        gunParts.push(barrel);
+        gun = Mesh.MergeMeshes(gunParts, true, true);
+        if (gun) {
+          gun.name = "gunView";
+          gun.material = gunMat;
+          gun.isPickable = false;
+          gun.parent = camera;
+          gun.position.set(0.3, -0.34, 0.78);
+          gun.rotation.set(0.04, -0.05, 0);
+          gun.scaling.setAll(0.9);
+        }
+      }
 
-        // マズルフラッシュ: 銃口付近の発光プレーン。発射時のみ短時間表示する。
+      // マズルフラッシュ: 銃口付近の発光プレーン。発射時のみ短時間表示する。
+      let muzzle: Mesh | null = null;
+      if (gun) {
         muzzle = MeshBuilder.CreatePlane("muzzle", { size: 0.4 }, scene);
         const muzzleMat = new StandardMaterial("muzzleMat", scene);
         muzzleMat.diffuseColor = new Color3(0, 0, 0);
@@ -808,7 +898,6 @@ export default function LockOnScene({ questions, onComplete }: LockOnSceneProps)
       pipeline.imageProcessing.vignetteWeight = 2.6;
       pipeline.imageProcessing.vignetteColor = new Color4(0, 0, 0, 0);
       pipeline.imageProcessing.vignetteCameraFov = 0.9;
-      // トーンマッピングやコントラスト補正で色味が変わらないよう既定のまま(vignetteだけ有効)。
 
       engine.setHardwareScalingLevel(hardwareScalingLevel);
 
@@ -839,6 +928,8 @@ export default function LockOnScene({ questions, onComplete }: LockOnSceneProps)
 
       const forwardRay = new Ray(Vector3.Zero(), Vector3.Zero(), 100);
       const labelAnchor = new Vector3(); // ネームタグ射影用の再利用ベクトル。
+      const S = templates.soldierScale;
+      const FOOT = templates.soldierFootOffset;
 
       // 現在の問題の敵AI兵士を配置する。
       function layoutQuestion(index: number) {
@@ -846,20 +937,31 @@ export default function LockOnScene({ questions, onComplete }: LockOnSceneProps)
         const n = Math.min(item.choices.length, MAX_ENEMIES);
         const startX = -((n - 1) / 2) * ENEMY_SPREAD;
         for (let i = 0; i < MAX_ENEMIES; i++) {
-          const enemy = enemyMeshes[i];
+          const inst = enemies[i];
+          const enemy = inst.root;
           // 撃破アニメで変化していたスケール/回転を戻す。
-          enemy.scaling.set(1, 1, 1);
-          enemy.rotation.set(0, 0, 0);
+          enemy.scaling.setAll(S);
+          enemy.rotation.set(0, SOLDIER_FACING_Y, 0);
           if (i < n) {
             const choice = item.choices[i];
-            enemy.position.set(startX + i * ENEMY_SPREAD, 0, ENEMY_Z);
+            const x = startX + i * ENEMY_SPREAD;
+            enemy.position.set(x, FOOT, ENEMY_Z);
             enemy.setEnabled(true);
-            (enemy.metadata as { choiceId: string | null }).choiceId = choice.id;
+            if (inst.collider) {
+              inst.collider.position.set(x, COLLIDER_SIZE.height / 2, ENEMY_Z);
+              inst.collider.setEnabled(true);
+              (inst.collider.metadata as { choiceId: string | null }).choiceId =
+                choice.id;
+            }
           } else {
             enemy.setEnabled(false);
-            (enemy.metadata as { choiceId: string | null }).choiceId = null;
+            if (inst.collider) {
+              inst.collider.setEnabled(false);
+              (inst.collider.metadata as { choiceId: string | null }).choiceId =
+                null;
+            }
           }
-          for (const m of enemyHiliteMats[i]) {
+          for (const m of inst.hiliteMats) {
             m.emissiveColor.copyFrom(ENEMY_EMISSIVE_BASE);
           }
         }
@@ -869,10 +971,6 @@ export default function LockOnScene({ questions, onComplete }: LockOnSceneProps)
 
       layoutQuestion(0);
 
-      // billboard(Y軸まわりでカメラを向く)行列を作りthin instanceへ書き込む。
-      // spawnDelayMs経過前のおとりはスケール0の行列にし、非表示相当にする。
-      const DECOY_HIDDEN_MATRIX = Matrix.Scaling(0, 0, 0);
-
       function updateDecoys(elapsed: number) {
         const cam = camera.position;
         for (let i = 0; i < DRONE_SPECS.length; i++) {
@@ -880,28 +978,26 @@ export default function LockOnScene({ questions, onComplete }: LockOnSceneProps)
             DRONE_SPECS[i],
             elapsed,
           );
+          const enemy = decoys[i].root;
           if (!dp.visible) {
-            DECOY_HIDDEN_MATRIX.copyToArray(decoyMatrices, i * 16);
+            if (enemy.isEnabled()) enemy.setEnabled(false);
             continue;
           }
+          if (!enemy.isEnabled()) enemy.setEnabled(true);
           const wx =
             DECOY_X_START +
             (((dp.x % DECOY_X_RANGE) + DECOY_X_RANGE) % DECOY_X_RANGE);
-          // 人型は接地させる(y=0)。zigzagの縦揺れ(dp.y)は奥行き方向の蛇行に割り当てる。
-          const wy = 0;
+          // 人型は接地させる。zigzagの縦揺れ(dp.y)は奥行き方向の蛇行に割り当てる。
           const wz = DECOY_Z + dp.y;
           const yaw = Math.atan2(cam.x - wx, cam.z - wz);
-          const m = Matrix.RotationY(yaw).multiply(
-            Matrix.Translation(wx, wy, wz),
-          );
-          m.copyToArray(decoyMatrices, i * 16);
+          enemy.position.set(wx, FOOT, wz);
+          enemy.rotation.set(0, yaw, 0);
         }
-        decoyBase.thinInstanceBufferUpdated("matrix");
       }
 
-      // カメラ前方の敵(選択肢の敵AI兵士)を判定する。おとり/銃/地面は predicate で除外。
+      // カメラ前方の敵(選択肢の敵AI兵士のコライダー)を判定する。おとり/銃/地面は predicate で除外。
       function pickAimedEnemy(): {
-        meshName: string;
+        enemyIndex: number;
         choiceId: string;
       } | null {
         const dir = camera.getForwardRay().direction;
@@ -917,15 +1013,17 @@ export default function LockOnScene({ questions, onComplete }: LockOnSceneProps)
             ),
         );
         if (pick?.hit && pick.pickedMesh) {
-          const cid = (pick.pickedMesh.metadata as { choiceId: string | null })
-            .choiceId;
-          if (cid) return { meshName: pick.pickedMesh.name, choiceId: cid };
+          const md = pick.pickedMesh.metadata as {
+            enemyIndex: number;
+            choiceId: string | null;
+          };
+          if (md.choiceId != null)
+            return { enemyIndex: md.enemyIndex, choiceId: md.choiceId };
         }
         return null;
       }
 
       // 命中(選択肢の敵にヒット)を記録する。questionIndexを進め、撃破アニメを開始する。
-      // アニメ完了後に次の問題をlayoutする(またはフェーズ完了)。
       function recordHit(enemyIndex: number, choiceId: string, now: number) {
         const item = qs[questionIndex];
         const correct = choiceId === item.correctChoiceId;
@@ -956,7 +1054,8 @@ export default function LockOnScene({ questions, onComplete }: LockOnSceneProps)
 
         // 撃破アニメーション開始。当たった敵だけ残し、他の選択肢の敵は隠す。
         for (let i = 0; i < MAX_ENEMIES; i++) {
-          if (i !== enemyIndex) enemyMeshes[i].setEnabled(false);
+          if (i !== enemyIndex) enemies[i].root.setEnabled(false);
+          if (enemies[i].collider) enemies[i].collider!.setEnabled(false);
         }
         setLabels([]); // アニメ中はネームタグを消す。
         killing = { enemyIndex, startMs: now, finishAfter };
@@ -965,12 +1064,12 @@ export default function LockOnScene({ questions, onComplete }: LockOnSceneProps)
       // 撃破アニメーション(Y縮小+傾き)を更新する。完了で次問題へ/フェーズ完了へ。
       function updateKilling(now: number) {
         if (!killing) return;
-        const enemy = enemyMeshes[killing.enemyIndex];
+        const enemy = enemies[killing.enemyIndex].root;
         const t = (now - killing.startMs) / KILL_ANIM_MS;
         if (t >= 1) {
           enemy.setEnabled(false);
-          enemy.scaling.set(1, 1, 1);
-          enemy.rotation.set(0, 0, 0);
+          enemy.scaling.setAll(S);
+          enemy.rotation.set(0, SOLDIER_FACING_Y, 0);
           const finishAfter = killing.finishAfter;
           killing = null;
           if (finishAfter) {
@@ -981,7 +1080,7 @@ export default function LockOnScene({ questions, onComplete }: LockOnSceneProps)
         } else {
           // Y方向に縮みつつ横に傾いて崩れ落ちる(スケルタルアニメ不要の簡易tween)。
           const k = 1 - t;
-          enemy.scaling.set(1, k, 1);
+          enemy.scaling.set(S, S * k, S);
           enemy.rotation.z = t * 1.0;
         }
       }
@@ -1010,7 +1109,10 @@ export default function LockOnScene({ questions, onComplete }: LockOnSceneProps)
         if (finished) return;
         finished = true;
         combo = 0;
-        for (const e of enemyMeshes) e.setEnabled(false);
+        for (const e of enemies) {
+          e.root.setEnabled(false);
+          e.collider?.setEnabled(false);
+        }
         onCompleteRef.current(results);
       }
 
@@ -1035,8 +1137,7 @@ export default function LockOnScene({ questions, onComplete }: LockOnSceneProps)
         const aimed = pickAimedEnemy();
         if (aimed) {
           // 選択肢の敵にヒット → 回答を記録し撃破演出へ。
-          const idx = enemyMeshes.findIndex((m) => m.name === aimed.meshName);
-          if (idx >= 0) recordHit(idx, aimed.choiceId, now);
+          recordHit(aimed.enemyIndex, aimed.choiceId, now);
         } else {
           // おとり/空振り → ミス。弾を1消費済み。問題は進行しない(狙い直せる)。
           missShotsThisQuestion += 1;
@@ -1067,7 +1168,7 @@ export default function LockOnScene({ questions, onComplete }: LockOnSceneProps)
 
       // 敵ネームタグ(選択肢テキスト)を頭上へ射影しDOMオーバーレイへ反映する。
       // 低スペック端末のDOM再描画・GC負荷を避けるためHUDと同間隔でスロットルする。
-      function pushLabels(now: number, aimedMeshName: string | null) {
+      function pushLabels(now: number, aimedIndex: number | null) {
         if (now - lastLabelsPush < LABELS_THROTTLE_MS) return;
         lastLabelsPush = now;
         const item = qs[questionIndex];
@@ -1078,7 +1179,7 @@ export default function LockOnScene({ questions, onComplete }: LockOnSceneProps)
         const next: EnemyLabel[] = [];
         const n = Math.min(item.choices.length, MAX_ENEMIES);
         for (let i = 0; i < n; i++) {
-          const enemy = enemyMeshes[i];
+          const enemy = enemies[i].root;
           // アンカーは敵の頭上(ネームタグ風)。
           labelAnchor.set(enemy.position.x, LABEL_Y, enemy.position.z);
           const p = Vector3.Project(labelAnchor, Matrix.Identity(), transform, vp);
@@ -1091,7 +1192,7 @@ export default function LockOnScene({ questions, onComplete }: LockOnSceneProps)
             x: (p.x / w) * 100,
             y: (p.y / h) * 100,
             visible,
-            aiming: enemy.name === aimedMeshName,
+            aiming: i === aimedIndex,
           });
         }
         setLabels(next);
@@ -1134,13 +1235,13 @@ export default function LockOnScene({ questions, onComplete }: LockOnSceneProps)
             } else {
               const aimed = pickAimedEnemy();
 
-              // 照準が乗っている敵をハイライト(迷彩/顔/ヘルメットの emissive を一括切替)。
+              // 照準が乗っている敵をハイライト(部位マテリアルの emissive を一括切替)。
               for (let i = 0; i < MAX_ENEMIES; i++) {
-                const isAimed = aimed && enemyMeshes[i].name === aimed.meshName;
+                const isAimed = aimed && aimed.enemyIndex === i;
                 const target = isAimed
                   ? ENEMY_EMISSIVE_AIM
                   : ENEMY_EMISSIVE_BASE;
-                for (const m of enemyHiliteMats[i]) {
+                for (const m of enemies[i].hiliteMats) {
                   m.emissiveColor.copyFrom(target);
                 }
               }
@@ -1153,7 +1254,7 @@ export default function LockOnScene({ questions, onComplete }: LockOnSceneProps)
 
               if (!finished && !killing) {
                 pushHud(now, aimed !== null);
-                pushLabels(now, aimed ? aimed.meshName : null);
+                pushLabels(now, aimed ? aimed.enemyIndex : null);
               }
             }
           }
@@ -1187,7 +1288,7 @@ export default function LockOnScene({ questions, onComplete }: LockOnSceneProps)
 
       handleResize = () => engine.resize();
       window.addEventListener("resize", handleResize);
-      setBenchmarking(false);
+      setLoading(false);
     };
 
     // マウント時: 本番Engine作成前にベンチマークを実行(初回のみ。キャッシュがあれば即返る)。
@@ -1200,7 +1301,16 @@ export default function LockOnScene({ questions, onComplete }: LockOnSceneProps)
         hardwareScalingLevel = 2;
       }
       if (disposed) return;
-      buildScene(hardwareScalingLevel);
+      try {
+        await buildScene(hardwareScalingLevel);
+      } catch (err) {
+        // 予期せぬ構築失敗でも画面を真っ白にしない。ローディングを閉じてフェーズをスキップする。
+        console.error("[LockOnScene] シーン構築に失敗しました。", err);
+        if (!disposed) {
+          setLoading(false);
+          onCompleteRef.current([]);
+        }
+      }
     })();
 
     return () => {
@@ -1246,12 +1356,12 @@ export default function LockOnScene({ questions, onComplete }: LockOnSceneProps)
         killFeed={killFeed}
         onFire={requestFire}
       />
-      {/* 初回起動時の簡易ベンチマーク中の軽量ローディングUI。 */}
-      {benchmarking ? (
+      {/* 初回起動時の簡易ベンチマーク・モデル読み込み中の軽量ローディングUI。 */}
+      {loading ? (
         <div className="absolute inset-0 z-20 flex flex-col items-center justify-center gap-3 bg-slate-950/90 text-white">
           <Spinner className="size-8 text-cyan-300" />
           <div className="text-sm font-medium tracking-widest opacity-80">
-            描画品質を計測中...
+            {loadingLabel}
           </div>
         </div>
       ) : null}

@@ -49,3 +49,6 @@ pnpm build
 ## ライセンス
 
 ライセンスは未設定です。利用範囲を決定後、この項目を更新します。
+
+## 素材クレジット
+- 交戦フェーズの3Dキャラクター・銃モデル: [Quaternius](https://quaternius.com/) (CC0ライセンス、poly.pizza経由)
