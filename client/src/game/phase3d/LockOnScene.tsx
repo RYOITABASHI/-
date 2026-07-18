@@ -9,12 +9,15 @@
 //       * 敵AI兵士: Quaternius「Ultimate Modular Men Pack」の SWAT キャラクター
 //         (/models/swat-soldier.glb, スケルタル・アニメーション付き)。
 //       * 銃ビューモデル: Quaternius「Assault Rifle」(/models/assault-rifle.glb)。
-//   - モデルは初回に1度だけ読み込み、テンプレートを clone して選択肢4体・おとり3体に使う。
-//   - SWATは1体9サブメッシュ(=9ドローコール)あるため、テンプレートを多重マテリアルMerge
-//     (multiMultiMaterials)で 1メッシュ・4サブメッシュに畳んでドローコールを抑える
-//     (7体×4=28ドローコール。緩和後予算60以下に収める)。
-//   - スケルトンは全クローンで共有し、Idle_Gun アニメーションをループ再生して立ち姿に生気を出す
-//     (共有のため骨行列計算は1体分で済む)。撃破は従来同様のノードtween(Y縮小+傾き)。
+//   - モデルは初回に1度だけ読み込み、AssetContainer.instantiateModelsToScene() で
+//     選択肢4体・おとり3体に個別複製する(MergeMeshesはスキニングを破綻させるため
+//     不使用。詳細は loadModelTemplates 直前のコメント参照)。
+//   - SWATは1体9サブメッシュ(=9ドローコール、非merge)。最大7体同時表示で約63ドローコール
+//     となり、緩和後予算(60以下)をわずかに超える見込みだが、対象端末はPUBGモバイル本編を
+//     動かせる性能があるため許容範囲とする(docs/game-spec.md 2026-07-18改訂参照)。
+//   - スケルトンはクローンごとに独立して複製される(instantiateModelsToScene の仕様)。
+//     各インスタンスで Idle_Gun アニメーションをループ再生して立ち姿に生気を出す。
+//     撃破は従来同様のノードtween(Y縮小+傾き)。
 //   - 照準判定は、スケルタルメッシュのレイ判定ブレを避けるため各敵に不可視のピック用
 //     コライダーボックスを持たせ、そこにメタデータを載せる(可視メッシュは isPickable=false)。
 //   - 読み込み失敗時は簡易な手続き生成兵士へフォールバックし、画面が真っ白にならないようにする。
@@ -408,9 +411,13 @@ export default function LockOnScene({ questions, onComplete }: LockOnSceneProps)
     let sceneForCleanup: Scene | null = null;
     let handleResize: (() => void) | null = null;
     let detachInput: (() => void) | null = null;
+    // LoadAssetContainerAsync で読み込んだ内容は scene の管理下に入らないため、
+    // scene.dispose() だけでは解放されない。アンマウント時に明示的に dispose する。
+    let soldierContainerForCleanup: AssetContainer | null = null;
 
     // ---- モデルテンプレートの読み込み(初回1度) ----
-    // SWATと銃をglTF読み込みし、兵士は多重マテリアルMergeで1メッシュ(4サブメッシュ)へ畳む。
+    // SWATと銃をglTF読み込みし、AssetContainer は clone 元テンプレートとして保持する
+    // (Merge はしない。理由は下記コメント参照)。
     // 失敗しても throw せず、簡易フォールバックのテンプレートを返す(画面が真っ白にならないよう)。
     const loadModelTemplates = async (scene: Scene): Promise<ModelTemplates> => {
       // --- 兵士 ---
@@ -430,6 +437,7 @@ export default function LockOnScene({ questions, onComplete }: LockOnSceneProps)
           "swat-soldier.glb",
           scene,
         );
+        soldierContainerForCleanup = container;
         // glTFのPBRMaterialはIBL(環境テクスチャ)無しだと真っ黒に見えるため、StandardMaterialへ変換する。
         for (const m of container.meshes) {
           if (m instanceof Mesh) convertPbrMaterialsToStandard(scene, m);
@@ -700,10 +708,18 @@ export default function LockOnScene({ questions, onComplete }: LockOnSceneProps)
           for (const r of inst.rootNodes) r.parent = parent;
           root = parent;
 
+          // 同じマテリアルが複数メッシュ(脚/胴/頭など)から参照されているため、
+          // 未処理のマテリアルのみ1回ずつ処理する(重複処理すると暗色化が多重に
+          // 掛かってしまい、共有回数に応じて意図よりずっと暗くなる)。
+          const processedMats = new Set<StandardMaterial | PBRMaterial>();
           forEachMeshOf(parent, (m) => {
             m.isPickable = false; // 可視メッシュは常に非ピック(ピックはコライダーで行う)。
             const mat = m.material;
-            if (mat instanceof StandardMaterial || mat instanceof PBRMaterial) {
+            if (
+              (mat instanceof StandardMaterial || mat instanceof PBRMaterial) &&
+              !processedMats.has(mat)
+            ) {
+              processedMats.add(mat);
               if (opts.darken < 1) {
                 if (mat instanceof PBRMaterial) {
                   mat.albedoColor.scaleInPlace(opts.darken);
@@ -1318,6 +1334,7 @@ export default function LockOnScene({ questions, onComplete }: LockOnSceneProps)
       if (handleResize) window.removeEventListener("resize", handleResize);
       if (detachInput) detachInput();
       sceneForCleanup?.dispose();
+      soldierContainerForCleanup?.dispose();
       engineForCleanup?.dispose();
     };
     // 依存は空: questions/onCompleteはrefで参照する(effectの再実行を避ける)。
